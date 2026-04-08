@@ -97,6 +97,55 @@ def setup_fp8_env(args: argparse.Namespace, current_env: dict[str, str]):
     return current_env
 
 
+def _apply_kt_config_to_env(args: argparse.Namespace, current_env: dict[str, str]) -> dict[str, str]:
+    """
+    Mirror `kt_config` entries from the accelerate config file into environment variables (following the FSDP/TP style)
+    so downstream code can detect KT before the user script starts.
+    """
+    kt_config = getattr(args, "kt_config", None)
+    if not kt_config:
+        return current_env
+
+    enabled = kt_config.get("enabled", True)
+    if "ACCELERATE_USE_KT" not in current_env and enabled is not None:
+        current_env["ACCELERATE_USE_KT"] = str(bool(enabled)).lower()
+
+    if not enabled:
+        return current_env
+
+    mapping = {
+        "kt_backend": "ACCELERATE_KT_BACKEND",
+        "kt_num_gpu_experts": "ACCELERATE_KT_NUM_GPU_EXPERTS",
+        "kt_num_threads": "ACCELERATE_KT_NUM_THREADS",
+        "kt_tp_enabled": "ACCELERATE_KT_TP_ENABLED",
+        "kt_threadpool_count": "ACCELERATE_KT_THREADPOOL_COUNT",
+        "kt_max_cache_depth": "ACCELERATE_KT_MAX_CACHE_DEPTH",
+        "kt_weight_path": "ACCELERATE_KT_WEIGHT_PATH",
+        "kt_use_lora_experts": "ACCELERATE_KT_USE_LORA_EXPERTS",
+        "kt_lora_expert_num": "ACCELERATE_KT_LORA_EXPERT_NUM",
+        "kt_lora_expert_intermediate_size": "ACCELERATE_KT_LORA_EXPERT_INTERMEDIATE_SIZE",
+        "lora_rank": "ACCELERATE_KT_LORA_RANK",
+        "lora_alpha": "ACCELERATE_KT_LORA_ALPHA",
+        "model_max_length": "ACCELERATE_KT_MODEL_MAX_LENGTH",
+        "kt_skip_expert_loading": "ACCELERATE_KT_SKIP_EXPERT_LOADING",
+        "kt_share_backward_bb": "ACCELERATE_KT_SHARE_BACKWARD_BB",
+        "bypass_device_map_check": "ACCELERATE_KT_BYPASS_DEVICE_MAP",
+        "skip_device_placement": "ACCELERATE_KT_SKIP_DEVICE_PLACEMENT",
+    }
+
+    for key, env_key in mapping.items():
+        if env_key in current_env or key not in kt_config:
+            continue
+        value = kt_config[key]
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            value = str(value).lower()
+        current_env[env_key] = str(value)
+
+    return current_env
+
+
 def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
     """
     Prepares and returns the command list and an environment with the correct simple launcher environment variables.
@@ -197,6 +246,7 @@ def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> tuple[list[str]
         current_env["ACCELERATE_USE_IPEX"] = str(args.ipex).lower()
     if args.enable_cpu_affinity:
         current_env["ACCELERATE_CPU_AFFINITY"] = "1"
+    current_env = _apply_kt_config_to_env(args, current_env)
     return cmd, current_env
 
 
@@ -351,6 +401,7 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> dict[str, str]:
         current_env["ACCELERATE_CPU_AFFINITY"] = "1"
 
     if not args.use_parallelism_config:
+        current_env = _apply_kt_config_to_env(args, current_env)
         return current_env
 
     prefix = "PARALLELISM_CONFIG_"
@@ -363,6 +414,7 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> dict[str, str]:
         if args.parallelism_config_cp_size > 1:
             current_env[prefix + "CP_COMM_STRATEGY"] = str(args.parallelism_config_cp_comm_strategy)
 
+    current_env = _apply_kt_config_to_env(args, current_env)
     return current_env
 
 
@@ -521,6 +573,7 @@ def prepare_deepspeed_cmd_env(args: argparse.Namespace) -> tuple[list[str], dict
         current_env["ACCELERATE_CPU_AFFINITY"] = "1"
     if args.deepspeed_moe_layer_cls_names is not None:
         current_env["ACCELERATE_DEEPSPEED_MOE_LAYER_CLS_NAMES"] = str(args.deepspeed_moe_layer_cls_names)
+    current_env = _apply_kt_config_to_env(args, current_env)
     return cmd, current_env
 
 
@@ -541,6 +594,7 @@ def prepare_tpu(
         # Take explicit args and set them up for XLA
         args.vm = args.tpu_vm
         args.tpu = args.tpu_name
+    current_env = _apply_kt_config_to_env(args, current_env)
     return args, current_env
 
 
@@ -638,6 +692,7 @@ def prepare_sagemager_args_inputs(
         "ACCELERATE_DYNAMO_USE_REGIONAL_COMPILATION": str(args.dynamo_use_regional_compilation),
         "ACCELERATE_SAGEMAKER_DISTRIBUTED_TYPE": sagemaker_config.distributed_type.value,
     }
+    environment = _apply_kt_config_to_env(args, environment)
     if args.mixed_precision.lower() == "fp8":
         if not is_fp8_available():
             raise RuntimeError(

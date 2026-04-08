@@ -468,6 +468,10 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
         model (`torch.nn.Module`):
             The model to load the state dict into, expected to be on meta device or a VRAM spike can occur
         full_sd (`dict`): The full state dict to load, can only be on rank 0
+
+    Note:
+        Parameters that are not DTensors (e.g., KT LoRA params on CPU) are handled separately
+        and copied directly without FSDP2 sharding.
     """
     import torch.distributed as dist
     from torch.distributed.tensor import distribute_tensor
@@ -475,6 +479,21 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
     # Model was previously copied to meta device
     meta_sharded_sd = model.state_dict()
     sharded_sd = {}
+
+    import logging
+    logger = logging.getLogger(__name__)
+    if accelerator.is_main_process:
+        full_keys = set(full_sd.keys())
+        meta_keys = set(meta_sharded_sd.keys())
+        if full_keys != meta_keys:
+            missing_in_full = sorted(meta_keys - full_keys)
+            extra_in_full = sorted(full_keys - meta_keys)
+            if missing_in_full:
+                logger.debug(f"fsdp2_load_full_state_dict: meta-only keys: {missing_in_full[:10]}")
+            if extra_in_full:
+                logger.debug(f"fsdp2_load_full_state_dict: full-only keys: {extra_in_full[:10]}")
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
 
     # Rank 0 distributes the full state dict to other ranks
     def _infer_parameter_dtype(model, param_name, empty_param):
@@ -502,33 +521,53 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
             tensor = tensor.contiguous()
         return tensor
 
+    def _is_dtensor(param):
+        """Check if a parameter is a DTensor (has device_mesh attribute)."""
+        return hasattr(param, 'device_mesh') and param.device_mesh is not None
+
+    meta_items = list(meta_sharded_sd.items())
     if accelerator.is_main_process:
-        for (param_name, full_param), sharded_param in zip(full_sd.items(), meta_sharded_sd.values()):
+        for meta_name, sharded_param in meta_items:
+            if meta_name not in full_sd:
+                raise KeyError(f"fsdp2_load_full_state_dict: missing key in full_sd: {meta_name}")
+            full_param = full_sd[meta_name]
+            if not _is_dtensor(sharded_param):
+                # Not a DTensor (e.g., KT LoRA params on CPU, ignored by FSDP).
+                # Keep on rank 0 only — no broadcast. Other ranks don't need them.
+                sharded_sd[meta_name] = full_param.detach()
+                continue
+
             device_mesh = sharded_param.device_mesh
             full_param = full_param.detach().to(device_mesh.device_type)
             dist.broadcast(full_param, src=0, group=dist.group.WORLD)
             sharded_tensor = distribute_tensor(full_param, device_mesh, sharded_param.placements)
             to_contiguous, casting_dtype = _infer_parameter_dtype(
                 model,
-                param_name,
+                meta_name,
                 full_param,
             )
             sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
-            sharded_sd[param_name] = sharded_tensor
+            sharded_sd[meta_name] = sharded_tensor
     # We need this else to have a matching `broadcast` for all of the ranks, else we deadlock
     else:
-        for param_name, sharded_param in meta_sharded_sd.items():
+        for meta_name, sharded_param in meta_items:
+            if not _is_dtensor(sharded_param):
+                # Not a DTensor (e.g., KT LoRA params) — rank 0 only, skip broadcast.
+                # Keep as meta tensor (zero memory) since only rank 0 uses these.
+                sharded_sd[meta_name] = sharded_param
+                continue
+
             device_mesh = sharded_param.device_mesh
             full_tensor = torch.empty(sharded_param.size(), device=device_mesh.device_type, dtype=sharded_param.dtype)
             dist.broadcast(full_tensor, src=0, group=dist.group.WORLD)
             sharded_tensor = distribute_tensor(full_tensor, device_mesh, sharded_param.placements)
             to_contiguous, casting_dtype = _infer_parameter_dtype(
                 model,
-                param_name,
+                meta_name,
                 full_tensor,
             )
             sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
-            sharded_sd[param_name] = sharded_tensor
+            sharded_sd[meta_name] = sharded_tensor
 
     # we set `assign=True` because our params are on meta device
     model.load_state_dict(sharded_sd, assign=True)
@@ -544,26 +583,37 @@ def fsdp2_switch_optimizer_parameters(optimizer: torch.optim.Optimizer, mapping:
         optimizer (`torch.optim.Optimizer`): Optimizer instance which contains the original model parameters
         mapping (`dict`): Mapping from the original parameter (specified by `data_ptr`) to the sharded parameter
 
-    Raises:
-        KeyError:
-            If a parameter in the optimizer couldn't be switched to its sharded version. This should never happen and
-            indicates a bug. If we kept the original params instead of raising, the training wouldn't be numerically
-            correct and weights wouldn't get updated.
+    Note:
+        Parameters not in the mapping (e.g., KT LoRA params on CPU that weren't sharded by FSDP2)
+        are kept as-is. This allows hybrid setups where some params are sharded and others are not.
     """
     from torch.distributed.tensor import DTensor
 
-    accessor_mapping = {}
+    def _get_data_ptr(p):
+        """Get data_ptr from a parameter, handling both:
+        - Original Parameters (data_ptr is a method)
+        - Temporary empty tensors with data_ptr assigned as an integer attribute
+        """
+        if isinstance(p, DTensor):
+            return p._local_tensor.data_ptr()
+        elif callable(getattr(p, 'data_ptr', None)):
+            # Original Parameter - data_ptr is a method
+            return p.data_ptr()
+        else:
+            # Temporary tensor with data_ptr assigned as integer attribute
+            return p.data_ptr
 
-    accessor_mapping[DTensor] = "_local_tensor"
-    try:
-        for param_group in optimizer.param_groups:
-            param_group["params"] = [mapping[p.data_ptr] for p in param_group["params"]]
-    except KeyError:
-        # This shouldn't ever happen, but we want to fail here else training wouldn't be numerically correct
-        # This basically means that we're missing a mapping from the original parameter to the sharded parameter
-        raise KeyError(
-            "A parameter in the optimizer couldn't be switched to its sharded version. This breaks the training. Please raise an issue on GitHub."
-        )
+    for param_group in optimizer.param_groups:
+        new_params = []
+        for p in param_group["params"]:
+            ptr = _get_data_ptr(p)
+            if ptr in mapping:
+                # Use the sharded version
+                new_params.append(mapping[ptr])
+            else:
+                # Keep original param (e.g., KT LoRA params on CPU not sharded by FSDP2)
+                new_params.append(p)
+        param_group["params"] = new_params
 
 
 def fsdp2_apply_ac(accelerator, model: torch.nn.Module):
@@ -610,10 +660,13 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         `torch.nn.Module`: Prepared model
     """
     from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy, fully_shard
+    import sys as _sys, os as _os
+    _rank = int(_os.environ.get("LOCAL_RANK", 0))
 
     is_type_fsdp = isinstance(model, FSDPModule) or (
         is_compiled_module(model) and isinstance(model._orig_mod, FSDPModule)
     )
+    print(f"[KT DIAG fsdp2_prepare_model rank={_rank}] model={type(model).__name__} is_type_fsdp={is_type_fsdp}", file=_sys.stderr, flush=True)
     if is_type_fsdp:
         return model
 
@@ -622,6 +675,7 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
     fsdp2_plugin.set_auto_wrap_policy(model)
 
     original_sd = model.state_dict()
+
     mesh = getattr(accelerator, "torch_device_mesh", None)
 
     fsdp2_kwargs = {
@@ -629,9 +683,18 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         "offload_policy": fsdp2_plugin.cpu_offload,
         # `fully_shard` doesn't accept `None` in case of `MixedPrecisionPolicy`
         "mp_policy": fsdp2_plugin.mixed_precision_policy or MixedPrecisionPolicy(),
-        "mesh": mesh[tuple(accelerator.parallelism_config.fsdp_dim_names)] if mesh is not None else None,
-        "ignored_params": get_parameters_from_modules(fsdp2_plugin.ignored_modules, model, accelerator.device),
+        "mesh": mesh[tuple(accelerator.parallelism_config.fsdp_dim_names)] if (mesh is not None and accelerator.parallelism_config.fsdp_dim_names) else None,
+        # ignored_params will be computed AFTER model.to("meta") so that parameter
+        # object references match the model's current params (to("meta") replaces them).
+        "ignored_params": set(),
     }
+
+    # --- Device breakdown of all params ---
+    _dev_counts = {}
+    for _pname, _p in model.named_parameters():
+        _dev = str(_p.device)
+        _dev_counts[_dev] = _dev_counts.get(_dev, 0) + 1
+    print(f"[KT DIAG fsdp2_prepare_model rank={_rank}] param device breakdown: {_dev_counts}", file=_sys.stderr, flush=True)
 
     model_has_params4bit = False
     for name, param in model.named_parameters():
@@ -642,6 +705,7 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
             model_has_params4bit = True
             break
 
+    print(f"[KT DIAG fsdp2_prepare_model rank={_rank}] params4bit={model_has_params4bit} cpu_ram_efficient_loading={fsdp2_plugin.cpu_ram_efficient_loading}", file=_sys.stderr, flush=True)
     if fsdp2_plugin.cpu_ram_efficient_loading and not model_has_params4bit:
         # Context: `fully_shard` moves the model to GPU if it was on CPU, however it can also be on `meta` and then it stays there even after `fully_shard`
         # For this reason, we need to move the model to `meta` device, as then sharding happens on `meta` device
@@ -662,20 +726,45 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         if hasattr(model, "tie_weights"):
             model.tie_weights()
 
+    # Compute ignored_params AFTER model.to("meta") so that parameter object
+    # references match the model's current params. model.to("meta") replaces
+    # all Parameter objects, making any earlier references stale.
+    fsdp2_kwargs["ignored_params"] = get_parameters_from_modules(
+        fsdp2_plugin.ignored_modules, model, accelerator.device
+    )
+    _n_ignored_mods = len(fsdp2_plugin.ignored_modules) if fsdp2_plugin.ignored_modules else 0
+    _n_ignored_params = len(fsdp2_kwargs["ignored_params"]) if fsdp2_kwargs["ignored_params"] else 0
+    print(f"[KT DIAG fsdp2_prepare_model rank={_rank}] ignored_modules={_n_ignored_mods} ignored_params={_n_ignored_params}", file=_sys.stderr, flush=True)
+
+    print(f"[KT DIAG fsdp2_prepare_model rank={_rank}] preparing auto_wrap_policy...", file=_sys.stderr, flush=True)
     auto_wrap_policy_func = fsdp2_prepare_auto_wrap_policy(fsdp2_plugin, model)
     if auto_wrap_policy_func is not None:
         # We skip the model itself, as that one is always wrapped
-        for module in get_module_children_bottom_up(model)[:-1]:
+        _children = get_module_children_bottom_up(model)[:-1]
+        _shard_count = 0
+        for module in _children:
             if auto_wrap_policy_func(module) and not isinstance(module, FSDPModule):
+                _shard_count += 1
                 fully_shard(module, **fsdp2_kwargs)
+        print(f"[KT DIAG fsdp2_prepare_model rank={_rank}] fully_shard called on {_shard_count}/{len(_children)} children", file=_sys.stderr, flush=True)
 
+    print(f"[KT DIAG fsdp2_prepare_model rank={_rank}] fully_shard root model (is_fsdp={isinstance(model, FSDPModule)})...", file=_sys.stderr, flush=True)
     if not isinstance(model, FSDPModule):
         fully_shard(model, **fsdp2_kwargs)
+    print(f"[KT DIAG fsdp2_prepare_model rank={_rank}] fully_shard done", file=_sys.stderr, flush=True)
 
     if fsdp2_plugin.cpu_ram_efficient_loading:
         # If `cpu_ram_efficient_loading` is enabled, only rank 0 loads the weights
         # Other ranks have an empty model on `meta` device, so we need to distribute the weights properly
+        # Barrier: rank 0 may be slow (e.g. loading KT MoE weights). Wait for all ranks
+        # before entering the collective to avoid gloo timeout.
+        import torch.distributed as _dist
+        if _dist.is_initialized():
+            print(f"[KT DIAG fsdp2_prepare_model rank={_rank}] barrier before fsdp2_load_full_state_dict...", file=_sys.stderr, flush=True)
+            _dist.barrier()
+        print(f"[KT DIAG fsdp2_prepare_model rank={_rank}] fsdp2_load_full_state_dict starting...", file=_sys.stderr, flush=True)
         fsdp2_load_full_state_dict(accelerator, model, original_sd)
+        print(f"[KT DIAG fsdp2_prepare_model rank={_rank}] fsdp2_load_full_state_dict done", file=_sys.stderr, flush=True)
 
     if fsdp2_plugin.cpu_ram_efficient_loading and not model_has_params4bit:
         # We re-register the buffers, as they may not be in the state_dict
@@ -698,6 +787,7 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         if hasattr(model, "tie_weights"):
             model.tie_weights()
 
+    print(f"[KT DIAG fsdp2_prepare_model rank={_rank}] buffer re-register done, checking mixed_precision...", file=_sys.stderr, flush=True)
     # There is no `dtype` attribution for nn.Module
     # Set it to None if it doesn't exist and do the upcast always
     model_dtype = getattr(model, "dtype", None)

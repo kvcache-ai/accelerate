@@ -140,7 +140,8 @@ class ParallelismConfig:
         dims = []
         if self.dp_replicate_enabled:
             dims += ["dp_replicate"]
-        dims += ["dp_shard_cp"]
+        if self.dp_shard_enabled or self.cp_enabled:
+            dims += ["dp_shard_cp"]
         return dims
 
     @property

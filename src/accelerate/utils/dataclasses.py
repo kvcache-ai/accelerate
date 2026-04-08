@@ -2767,6 +2767,72 @@ def parse_llama_config(megatron_lm_plugin, model, batch_data):
 
 
 @dataclass
+class KTransformersPlugin:
+    """
+    Plugin to enable KTransformers MoE wrapping inside Accelerate.
+
+    Follows the DeepSpeed pattern: only accelerate-framework interaction fields
+    are defined here. KT-kernel-specific configuration is passed through the
+    opaque ``kt_config`` field (similar to ``DeepSpeedPlugin.hf_ds_config``).
+
+    Args:
+        enabled (`bool`, defaults to env ACCELERATE_USE_KT or False):
+            Whether to enable KT wrapping.
+        kt_config (`Any`, defaults to None):
+            KT-kernel configuration. Accepts a ``kt_kernel.sft.KTConfig`` object
+            or a dict (passed to ``KTConfig(**dict)``). If None, a default
+            ``KTConfig()`` is created (reads ACCELERATE_KT_* env vars).
+        bypass_device_map_check (`bool`, defaults to True):
+            Skip Accelerate's device_map validation.
+        skip_device_placement (`bool`, defaults to True):
+            Force device_placement=False for models wrapped by KT.
+        allowed_distributed_types (`tuple[DistributedType, ...]`):
+            Allowed distributed types when KT is enabled.
+        require_single_process (`bool`, defaults to False):
+            Require single-process execution.
+    """
+
+    enabled: bool | None = None
+    kt_config: Any = None
+    bypass_device_map_check: bool | None = None
+    skip_device_placement: bool | None = None
+    allowed_distributed_types: tuple[DistributedType, ...] = (DistributedType.NO, DistributedType.FSDP, DistributedType.MULTI_GPU)
+    require_single_process: bool = False
+
+    def __post_init__(self):
+        if self.enabled is None:
+            self.enabled = parse_flag_from_env("ACCELERATE_USE_KT", default=False)
+
+        # Resolve kt_config: dict → KTConfig, None → default KTConfig
+        if self.kt_config is None:
+            try:
+                from kt_kernel.sft import KTConfig
+                self.kt_config = KTConfig()
+            except ImportError:
+                self.kt_config = None
+        elif isinstance(self.kt_config, dict):
+            try:
+                from kt_kernel.sft import KTConfig
+                self.kt_config = KTConfig(**self.kt_config)
+            except ImportError:
+                pass  # keep as dict if kt_kernel not installed
+
+        # Set skip_expert_loading default when enabled
+        if self.kt_config is not None and self.enabled:
+            if getattr(self.kt_config, "skip_expert_loading", None) is None:
+                self.kt_config.skip_expert_loading = True
+
+        if self.bypass_device_map_check is None:
+            self.bypass_device_map_check = parse_flag_from_env(
+                "ACCELERATE_KT_BYPASS_DEVICE_MAP", default=True
+            )
+
+        if self.skip_device_placement is None:
+            self.skip_device_placement = parse_flag_from_env(
+                "ACCELERATE_KT_SKIP_DEVICE_PLACEMENT", default=True
+            )
+
+@dataclass
 class BnbQuantizationConfig:
     """
     A plugin to enable BitsAndBytes 4bit and 8bit quantization

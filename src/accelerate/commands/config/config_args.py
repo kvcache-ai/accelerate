@@ -194,6 +194,8 @@ class ClusterConfig(BaseConfig):
     deepspeed_config: Optional[dict] = None
     # args for fsdp
     fsdp_config: Optional[dict] = None
+    # args for ktransformers
+    kt_config: Optional[dict] = None
     # args for parallelism config
     parallelism_config: Optional[dict] = None
     # args for megatron_lm
@@ -223,6 +225,8 @@ class ClusterConfig(BaseConfig):
             self.deepspeed_config = {}
         if self.fsdp_config is None:
             self.fsdp_config = {}
+        if self.kt_config is None:
+            self.kt_config = {}
         if self.megatron_lm_config is None:
             self.megatron_lm_config = {}
         if self.ipex_config is None:

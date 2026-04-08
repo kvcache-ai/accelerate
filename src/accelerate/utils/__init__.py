@@ -65,8 +65,11 @@ from .dataclasses import (
     TorchDynamoPlugin,
     TorchTensorParallelConfig,
     TorchTensorParallelPlugin,
+    KTransformersPlugin,
     add_model_config_to_megatron_parser,
 )
+import importlib.util as _u
+KT_KERNEL_AVAILABLE = _u.find_spec("kt_kernel") is not None
 from .environment import (
     are_libraries_initialized,
     check_cuda_fp8_capability,

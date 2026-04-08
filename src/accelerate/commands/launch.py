@@ -1069,6 +1069,8 @@ def _validate_launch_command(args):
             args.use_megatron_lm = defaults.distributed_type == DistributedType.MEGATRON_LM
             args.tpu_use_cluster = defaults.tpu_use_cluster if args.tpu else False
             args.use_parallelism_config = defaults.parallelism_config != {}
+            if defaults.kt_config:
+                args.kt_config = defaults.kt_config
         if args.gpu_ids is None:
             if defaults.gpu_ids is not None:
                 args.gpu_ids = defaults.gpu_ids

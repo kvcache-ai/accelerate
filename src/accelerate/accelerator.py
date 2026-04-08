@@ -63,6 +63,7 @@ from .utils import (
     GradientAccumulationPlugin,
     GradScalerKwargs,
     InitProcessGroupKwargs,
+    KTransformersPlugin,
     KwargsHandler,
     LoggerType,
     MegatronLMPlugin,
@@ -214,6 +215,8 @@ class Accelerator:
         megatron_lm_plugin ([`~utils.MegatronLMPlugin`], *optional*):
             Tweak your MegatronLM related args using this argument. This argument is optional and can be configured
             directly using *accelerate config*
+        kt_config ([`~utils.KTransformersPlugin`], *optional*):
+            Enable KTransformers MoE wrapping inside Accelerate.
         rng_types (list of `str` or [`~utils.RNGType`]):
             The list of random number generators to synchronize at the beginning of each iteration in your prepared
             dataloaders. Should be one or several of:
@@ -287,6 +290,7 @@ class Accelerator:
         fsdp_plugin: FullyShardedDataParallelPlugin | None = None,
         torch_tp_plugin: TorchTensorParallelPlugin | None = None,  # Deprecate later, warning in `post_init`
         megatron_lm_plugin: MegatronLMPlugin | None = None,
+        kt_config: KTransformersPlugin | None = None,
         rng_types: list[str | RNGType] | None = None,
         log_with: str | LoggerType | GeneralTracker | list[str | LoggerType | GeneralTracker] | None = None,
         project_dir: str | os.PathLike | None = None,
@@ -411,6 +415,16 @@ class Accelerator:
             if not is_megatron_lm_available():
                 raise ImportError("Megatron is not installed. please build it from source.")
 
+        if kt_config is None:
+            kt_config_candidate = KTransformersPlugin()
+            if kt_config_candidate.enabled:
+                kt_config = kt_config_candidate
+        elif not isinstance(kt_config, KTransformersPlugin):
+            raise TypeError("`kt_config` must be a KTransformersPlugin object.")
+
+        if kt_config is not None and not kt_config.enabled:
+            kt_config = None
+
         # Kwargs handlers
         self.ddp_handler = None
         self.scaler_handler = None
@@ -465,6 +479,7 @@ class Accelerator:
             deepspeed_plugin=deepspeed_plugins,
             fsdp_plugin=fsdp_plugin,
             megatron_lm_plugin=megatron_lm_plugin,
+            kt_config=kt_config,
             parallelism_config=parallelism_config,
             _from_accelerator=True,
             **kwargs,
@@ -1456,6 +1471,11 @@ class Accelerator:
         ... )
         ```
         """
+        kt_plugin = getattr(self.state, "kt_config", None)
+        kt_bypass_device_map = bool(
+            kt_plugin is not None and kt_plugin.enabled and kt_plugin.bypass_device_map_check
+        )
+
         if device_placement is None:
             device_placement = [None for _ in args]
         elif self.distributed_type in (DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM):
@@ -1472,6 +1492,7 @@ class Accelerator:
                 and self.verify_device_map(obj)
                 and self.distributed_type != DistributedType.NO
                 and os.environ.get("ACCELERATE_BYPASS_DEVICE_MAP", "false") != "true"
+                and not kt_bypass_device_map
             ):
                 raise ValueError(
                     "You can't train a model that has been loaded with `device_map='auto'` in any distributed mode."
@@ -1543,6 +1564,8 @@ class Accelerator:
         if self.parallelism_config and self.parallelism_config.cp_enabled:
             args = self._prepare_cp(*args)
 
+        _rank = os.environ.get("LOCAL_RANK", "?")
+        print(f"[DIAG rank={_rank}] prepare: distributed_type={self.distributed_type}, is_fsdp2={self.is_fsdp2}", flush=True)
         if self.fp8_backend == FP8BackendType.TE:
             args = self._prepare_te(*args)
         elif self.fp8_backend == FP8BackendType.AO:
@@ -1552,8 +1575,10 @@ class Accelerator:
         elif self.distributed_type == DistributedType.MEGATRON_LM:
             result = self._prepare_megatron_lm(*args)
         elif self.is_fsdp2:
+            print(f"[DIAG rank={_rank}] prepare: entering _prepare_fsdp2", flush=True)
             result = self._prepare_fsdp2(*args)
         else:
+            print(f"[DIAG rank={_rank}] prepare: entering else branch (_prepare_one)", flush=True)
             if self.fp8_backend == FP8BackendType.MSAMP:
                 args, device_placement = self._prepare_msamp(*args, device_placement=device_placement)
             result = tuple(
@@ -1580,6 +1605,9 @@ class Accelerator:
         return result if len(result) > 1 else result[0]
 
     def _prepare_tp(self, *args):
+        import os as _os, sys as _sys
+        _rank = _os.environ.get("LOCAL_RANK", "?")
+        print(f"[DIAG rank={_rank}] _prepare_tp entered", file=_sys.stderr, flush=True)
         # First pass: prepare everything except schedulers (and model, which is prepared separately below)
         result = [
             self._prepare_one(obj, first_pass=True) if not isinstance(obj, torch.nn.Module) else obj for obj in args
@@ -1589,30 +1617,117 @@ class Accelerator:
         result = [self._prepare_one(obj) if not isinstance(obj, torch.nn.Module) else obj for obj in result]
 
         device_mesh = self.torch_device_mesh
+        print(f"[DIAG rank={_rank}] _prepare_tp device_mesh={device_mesh}", file=_sys.stderr, flush=True)
 
         for arg in result:
             if not isinstance(arg, torch.nn.Module):
                 continue
 
-            from torch.distributed.tensor import DTensor, Replicate
+            from torch.distributed.tensor import DTensor, Replicate, Shard
             from transformers.integrations.tensor_parallel import ReplicateParallel
 
             model: torch.nn.Module = arg
-            tp_plan = ReplicateParallel
+            tp_mesh = device_mesh["tp"]
+            tp_rank = int(tp_mesh.get_local_rank())
+            tp_size = int(tp_mesh.size())
 
-            for name, param in model.named_parameters():
+            _n_dtensor, _n_cuda, _n_skip, _n_lora = 0, 0, 0, 0
+            if not hasattr(model, '_tp_lora_shard_info'):
+                model._tp_lora_shard_info = {}
+            for name, param in list(model.named_parameters()):
                 if isinstance(param, DTensor):
+                    _n_dtensor += 1
+                    continue
+                if param.device.type != "cuda":
+                    _n_skip += 1
                     continue
 
-                dp = DTensor.from_local(param, device_mesh=device_mesh["tp"], placements=[Replicate()])
+                is_lora_b = ".lora_B." in name
+                is_lora_a = ".lora_A." in name
+
+                if is_lora_a or is_lora_b:
+                    # Find parent PEFT module to check base layer's TP plan
+                    parts = name.split(".")
+                    keyword = "lora_B" if is_lora_b else "lora_A"
+                    lora_idx = next(i for i, p in enumerate(parts) if p == keyword)
+                    peft_path = ".".join(parts[:lora_idx])
+                    try:
+                        peft_mod = model.get_submodule(peft_path)
+                        base = getattr(peft_mod, "base_layer", None)
+                    except Exception:
+                        base = None
+
+                    if base is not None and hasattr(base, "weight") and isinstance(base.weight, DTensor):
+                        base_placements = base.weight.placements
+                        is_colwise = any(isinstance(p, Shard) and p.dim in (0, -2) for p in base_placements)
+                        is_rowwise = any(isinstance(p, Shard) and p.dim in (1, -1) for p in base_placements)
+
+                        if is_lora_b and is_colwise:
+                            # Colwise base: shard lora_B on dim 0 (out_features)
+                            out_f = param.shape[0]
+                            local_out = out_f // tp_size
+                            new_w = param.data[tp_rank * local_out : (tp_rank + 1) * local_out].contiguous()
+                            mod_path, attr = name.rsplit(".", 1)
+                            setattr(model.get_submodule(mod_path), attr,
+                                    torch.nn.Parameter(new_w, requires_grad=param.requires_grad))
+                            _n_lora += 1
+                            model._tp_lora_shard_info[name] = {'shard_dim': 0, 'tp_size': tp_size}
+                            print(f"[TP-LoRA rank={_rank}] colwise shard lora_B: {name} {list(param.shape)}->{list(new_w.shape)}", file=_sys.stderr, flush=True)
+                            continue
+
+                        if is_lora_a and is_rowwise:
+                            # Rowwise base: shard lora_A on dim 1 (in_features) + allreduce hook
+                            in_f = param.shape[1]
+                            local_in = in_f // tp_size
+                            new_w = param.data[:, tp_rank * local_in : (tp_rank + 1) * local_in].contiguous()
+                            mod_path, attr = name.rsplit(".", 1)
+                            lora_a_module = model.get_submodule(mod_path)
+                            setattr(lora_a_module, attr,
+                                    torch.nn.Parameter(new_w, requires_grad=param.requires_grad))
+                            # Register allreduce hook: partial matmul results must be summed across TP ranks
+                            _tp_group = tp_mesh.get_group()
+                            def _allreduce_hook(_mod, _inp, output, group=_tp_group):
+                                torch.distributed.all_reduce(output, group=group)
+                                return output
+                            lora_a_module.register_forward_hook(_allreduce_hook)
+                            _n_lora += 1
+                            model._tp_lora_shard_info[name] = {'shard_dim': 1, 'tp_size': tp_size}
+                            print(f"[TP-LoRA rank={_rank}] rowwise shard lora_A+allreduce: {name} {list(param.shape)}->{list(new_w.shape)}", file=_sys.stderr, flush=True)
+                            continue
+
+                        if is_lora_a and is_colwise:
+                            # lora_A is replicated on colwise layer: each rank gets partial gradient
+                            # (through its sharded lora_B), so we need gradient all-reduce to keep A in sync.
+                            _tp_group = tp_mesh.get_group()
+                            param.register_hook(
+                                lambda grad, group=_tp_group: (
+                                    torch.distributed.all_reduce(grad, group=group), grad
+                                )[1]
+                            )
+                            _n_lora += 1
+                            print(f"[TP-LoRA rank={_rank}] colwise lora_A grad allreduce: {name} {list(param.shape)}", file=_sys.stderr, flush=True)
+                        else:
+                            # lora_B on rowwise: gradient is naturally replicated (no sync needed)
+                            print(f"[TP-LoRA rank={_rank}] skip (no shard needed): {name} {list(param.shape)}", file=_sys.stderr, flush=True)
+
+                    # LoRA param on non-TP-sharded layer (or couldn't determine): skip wrapping
+                    continue
+
+                # Non-LoRA param: wrap as Replicate (original behavior)
+                _n_cuda += 1
+                dp = DTensor.from_local(param, device_mesh=tp_mesh, placements=[Replicate()])
                 param_name, param_type = name.rsplit(".", 1)
                 module_to_tp = model.get_submodule(param_name)
 
-                tp_plan().prepare_module_tp(module_to_tp, device_mesh["tp"])
+                ReplicateParallel().prepare_module_tp(module_to_tp, tp_mesh)
                 if not isinstance(dp, torch.nn.Parameter):
                     dp = torch.nn.Parameter(dp, requires_grad=param.requires_grad)
                 setattr(module_to_tp, param_type, dp)
 
+            print(f"[DIAG rank={_rank}] _prepare_tp model done: dtensor={_n_dtensor}, cuda_wrapped={_n_cuda}, cpu_skipped={_n_skip}, lora_sharded={_n_lora}", file=_sys.stderr, flush=True)
+
+        _n_models = sum(1 for a in result if isinstance(a, torch.nn.Module))
+        print(f"[DIAG rank={_rank}] _prepare_tp exit: {len(result)} args, {_n_models} models", file=_sys.stderr, flush=True)
         return args
 
     def _prepare_cp(self, *args):
@@ -1649,6 +1764,42 @@ class Accelerator:
         if model_index is None:
             return tuple(result)
 
+        # Register KT expert modules as ignored_modules for FSDP2
+        # Only ignore the experts submodule (CPU-side, managed by KT kernel).
+        # The router (gate) and shared_experts remain FSDP2-managed so their
+        # gradients are properly all-reduced across ranks.
+        kt_plugin = getattr(self.state, "kt_config", None)
+        kt_wrappers = None
+        if kt_plugin is not None and kt_plugin.enabled:
+            # _kt_wrappers lives on the base model, not on PEFT/FSDP wrappers.
+            # Unwrap through base_model / model attributes to find it.
+            kt_wrappers = getattr(model, "_kt_wrappers", None)
+            if kt_wrappers is None:
+                _base = model
+                for _attr in ("base_model", "model"):
+                    _base = getattr(_base, _attr, None)
+                    if _base is None:
+                        break
+                    kt_wrappers = getattr(_base, "_kt_wrappers", None)
+                    if kt_wrappers is not None:
+                        break
+        import sys as _sys
+        _rank = int(os.environ.get("LOCAL_RANK", 0))
+        _has_opt = any(isinstance(o, torch.optim.Optimizer) for o in result)
+        print(f"[KT DIAG _prepare_fsdp2 rank={_rank}] enter: model={type(model).__name__} has_optimizer={_has_opt} kt_wrappers={'found' if kt_wrappers is not None else 'NOT_FOUND'}", file=_sys.stderr, flush=True)
+
+        if kt_wrappers is not None:
+            if self.state.fsdp_plugin.ignored_modules is None:
+                self.state.fsdp_plugin.ignored_modules = []
+            _n_ignored_before = len(self.state.fsdp_plugin.ignored_modules)
+            for wrapper in kt_wrappers:
+                experts_attr = getattr(wrapper, '_experts_attr', 'experts')
+                experts = getattr(wrapper, experts_attr, None)
+                if experts is not None and experts not in self.state.fsdp_plugin.ignored_modules:
+                    self.state.fsdp_plugin.ignored_modules.append(experts)
+            _n_ignored_after = len(self.state.fsdp_plugin.ignored_modules)
+            print(f"[KT DIAG _prepare_fsdp2 rank={_rank}] ignored_modules: {_n_ignored_before} -> {_n_ignored_after}", file=_sys.stderr, flush=True)
+
         # Needs to be done first, to make sure AC + fully_shard will work as expected
         self.state.fsdp_plugin.set_auto_wrap_policy(model)
 
@@ -1667,24 +1818,43 @@ class Accelerator:
         # Get old params and canonicalize - we canonicalize to have the mapping easy
         old_named_params = fsdp2_canonicalize_names(self._get_named_parameters(*tuple(result), drop_refs=True))
 
+        # Collect KT LoRA param data_ptrs to skip them during optimizer param swapping
+        # These params are on CPU and managed by KT kernel, not FSDP2
+        kt_lora_param_ptrs = set()
+        if kt_wrappers is not None:
+            from kt_kernel.sft import get_kt_lora_params
+            for param in get_kt_lora_params(model):
+                kt_lora_param_ptrs.add(param.data_ptr())
+
         # Swap the optimizer parameters with empty, so `fully_shard` after will not allocate too much memory
+        # BUT skip KT LoRA params - they should keep their original references
         from torch.distributed.tensor import DTensor
 
+        kt_lora_params_saved = {}  # Save KT LoRA params to restore later
+        _n_kt_kept, _n_swapped = 0, 0
         for obj in result:
             if isinstance(obj, torch.optim.Optimizer):
                 for param_group in obj.param_groups:
                     for i, p in enumerate(param_group["params"]):
+                        p_ptr = p._local_tensor.data_ptr() if isinstance(p, DTensor) else p.data_ptr()
+                        if p_ptr in kt_lora_param_ptrs:
+                            # Keep original KT LoRA param, save for later restoration
+                            kt_lora_params_saved[p_ptr] = p
+                            _n_kt_kept += 1
+                            continue
                         # We drop a reference to the original param here, so that _move_states_to_device triggers a reallocation
                         # We reassign the data_ptr to the original param, so that we preserve the mapping to the new ones
                         param_group["params"][i] = torch.empty(1, dtype=p.dtype, device=p.device)
-                        param_group["params"][i].data_ptr = (
-                            p._local_tensor.data_ptr() if isinstance(p, DTensor) else p.data_ptr()
-                        )
+                        param_group["params"][i].data_ptr = p_ptr
+                        _n_swapped += 1
+        print(f"[KT DIAG _prepare_fsdp2 rank={_rank}] optimizer param swap: {_n_swapped} swapped, {_n_kt_kept} KT kept", file=_sys.stderr, flush=True)
 
         self._models.append(model)
 
+        print(f"[KT DIAG _prepare_fsdp2 rank={_rank}] calling fsdp2_prepare_model...", file=_sys.stderr, flush=True)
         # Prepare everything FSDP2 related for the model (except AC)
         model = fsdp2_prepare_model(self, model)
+        print(f"[KT DIAG _prepare_fsdp2 rank={_rank}] fsdp2_prepare_model returned", file=_sys.stderr, flush=True)
 
         # Remove the old model from the list
         if len(self._models) > 1 and (self._models[-2] is self._models[-1]):
@@ -1731,16 +1901,36 @@ class Accelerator:
         >>> model = accelerator.prepare_model(model)
         ```
         """
+        kt_plugin = getattr(self.state, "kt_config", None)
+        kt_bypass_device_map = bool(
+            kt_plugin is not None and kt_plugin.enabled and kt_plugin.bypass_device_map_check
+        )
         if device_placement is None:
             device_placement = self.device_placement and self.distributed_type != DistributedType.FSDP
+        if kt_plugin is not None and kt_plugin.enabled and kt_plugin.skip_device_placement:
+            if device_placement:
+                logger.warning("KT plugin enabled; forcing device_placement=False to preserve CPU/GPU placement.")
+            device_placement = False
 
         self._models.append(model)
+
+        if kt_plugin is not None and kt_plugin.enabled:
+            if kt_plugin.require_single_process and self.num_processes != 1:
+                raise ValueError("KT plugin requires single-process execution.")
+            if self.distributed_type not in kt_plugin.allowed_distributed_types:
+                raise ValueError(
+                    f"KT plugin does not support distributed type {self.distributed_type}. "
+                    f"Allowed: {kt_plugin.allowed_distributed_types}"
+                )
+            # KT is compatible with TP when using native TP (from_pretrained tp_plan="auto"):
+            # expert weights stay on CPU (handled by KT C++ kernel), non-expert weights are TP-sharded.
 
         # TODO: Look at enabling native TP training directly with a proper config
         if (
             self.verify_device_map(model)
             and self.distributed_type != DistributedType.NO
             and os.environ.get("ACCELERATE_BYPASS_DEVICE_MAP", "false") != "true"
+            and not kt_bypass_device_map
         ):
             raise ValueError(
                 "You can't train a model that has been loaded with `device_map='auto'` in any distributed mode."
@@ -2738,6 +2928,36 @@ class Accelerator:
             self.lomo_backward(loss, learning_rate)
         else:
             loss.backward(**kwargs)
+
+        # Ensure KT LoRA params are in the optimizer (they may have been added after optimizer creation)
+        if not getattr(self, "_kt_lora_injected", False):
+            from kt_kernel.sft import get_kt_lora_params
+            _models = [m for m in self._models if hasattr(m, 'parameters')]
+            if _models:
+                _kt_params = get_kt_lora_params(_models[0])
+                if not _kt_params:
+                    # Try unwrapped model
+                    unwrapped = self.unwrap_model(_models[0])
+                    _kt_params = get_kt_lora_params(unwrapped)
+                if _kt_params and self._optimizers:
+                    opt = self._optimizers[0]
+                    existing_ids = set()
+                    for group in opt.param_groups:
+                        for p in group['params']:
+                            existing_ids.add(id(p))
+                    missing = [p for p in _kt_params if id(p) not in existing_ids]
+                    if missing:
+                        # Add as a new param group with the same lr as the first group
+                        lr = opt.param_groups[0].get('lr', 1e-4)
+                        opt.add_param_group({'params': missing, 'lr': lr})
+                        print(f"\033[32m[KT] Added {len(missing)} KT LoRA params to optimizer (lr={lr})\033[0m",
+                              flush=True)
+                    self._kt_lora_injected = True
+                else:
+                    print(f"\033[31m[KT] No KT params found or no optimizers. "
+                          f"models={len(_models)} kt_params={len(_kt_params) if _kt_params else 0} "
+                          f"optimizers={len(self._optimizers)}\033[0m", flush=True)
+                    self._kt_lora_injected = True  # Don't retry
 
     def set_trigger(self):
         """
