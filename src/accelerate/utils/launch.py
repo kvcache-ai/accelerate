@@ -124,13 +124,11 @@ def _apply_kt_config_to_env(args: argparse.Namespace, current_env: dict[str, str
         "kt_use_lora_experts": "ACCELERATE_KT_USE_LORA_EXPERTS",
         "kt_lora_expert_num": "ACCELERATE_KT_LORA_EXPERT_NUM",
         "kt_lora_expert_intermediate_size": "ACCELERATE_KT_LORA_EXPERT_INTERMEDIATE_SIZE",
-        "lora_rank": "ACCELERATE_KT_LORA_RANK",
-        "lora_alpha": "ACCELERATE_KT_LORA_ALPHA",
-        "model_max_length": "ACCELERATE_KT_MODEL_MAX_LENGTH",
+        "kt_lora_rank": "ACCELERATE_KT_LORA_RANK",
+        "kt_lora_alpha": "ACCELERATE_KT_LORA_ALPHA",
+        "kt_model_max_length": "ACCELERATE_KT_MODEL_MAX_LENGTH",
         "kt_skip_expert_loading": "ACCELERATE_KT_SKIP_EXPERT_LOADING",
         "kt_share_backward_bb": "ACCELERATE_KT_SHARE_BACKWARD_BB",
-        "bypass_device_map_check": "ACCELERATE_KT_BYPASS_DEVICE_MAP",
-        "skip_device_placement": "ACCELERATE_KT_SKIP_DEVICE_PLACEMENT",
     }
 
     for key, env_key in mapping.items():
@@ -573,7 +571,6 @@ def prepare_deepspeed_cmd_env(args: argparse.Namespace) -> tuple[list[str], dict
         current_env["ACCELERATE_CPU_AFFINITY"] = "1"
     if args.deepspeed_moe_layer_cls_names is not None:
         current_env["ACCELERATE_DEEPSPEED_MOE_LAYER_CLS_NAMES"] = str(args.deepspeed_moe_layer_cls_names)
-    current_env = _apply_kt_config_to_env(args, current_env)
     return cmd, current_env
 
 
@@ -594,7 +591,6 @@ def prepare_tpu(
         # Take explicit args and set them up for XLA
         args.vm = args.tpu_vm
         args.tpu = args.tpu_name
-    current_env = _apply_kt_config_to_env(args, current_env)
     return args, current_env
 
 
@@ -692,7 +688,6 @@ def prepare_sagemager_args_inputs(
         "ACCELERATE_DYNAMO_USE_REGIONAL_COMPILATION": str(args.dynamo_use_regional_compilation),
         "ACCELERATE_SAGEMAKER_DISTRIBUTED_TYPE": sagemaker_config.distributed_type.value,
     }
-    environment = _apply_kt_config_to_env(args, environment)
     if args.mixed_precision.lower() == "fp8":
         if not is_fp8_available():
             raise RuntimeError(
