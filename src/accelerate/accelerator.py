@@ -63,6 +63,7 @@ from .utils import (
     GradientAccumulationPlugin,
     GradScalerKwargs,
     InitProcessGroupKwargs,
+    KTransformersPlugin,
     KwargsHandler,
     LoggerType,
     MegatronLMPlugin,
@@ -288,6 +289,7 @@ class Accelerator:
         fsdp_plugin: FullyShardedDataParallelPlugin | None = None,
         torch_tp_plugin: TorchTensorParallelPlugin | None = None,  # Deprecate later, warning in `post_init`
         megatron_lm_plugin: MegatronLMPlugin | None = None,
+        kt_config: KTransformersPlugin | None = None,
         rng_types: list[str | RNGType] | None = None,
         log_with: str | LoggerType | GeneralTracker | list[str | LoggerType | GeneralTracker] | None = None,
         project_dir: str | os.PathLike | None = None,
@@ -412,6 +414,17 @@ class Accelerator:
             if not is_megatron_lm_available():
                 raise ImportError("Megatron is not installed. please build it from source.")
 
+        # KT plugin
+        if kt_config is None:
+            kt_config_candidate = KTransformersPlugin()
+            if kt_config_candidate.enabled:
+                kt_config = kt_config_candidate
+        elif not isinstance(kt_config, KTransformersPlugin):
+            raise TypeError("`kt_config` must be a KTransformersPlugin object.")
+
+        if kt_config is not None and not kt_config.enabled:
+            kt_config = None
+
         # Kwargs handlers
         self.ddp_handler = None
         self.scaler_handler = None
@@ -466,6 +479,7 @@ class Accelerator:
             deepspeed_plugin=deepspeed_plugins,
             fsdp_plugin=fsdp_plugin,
             megatron_lm_plugin=megatron_lm_plugin,
+            kt_config=kt_config,
             parallelism_config=parallelism_config,
             _from_accelerator=True,
             **kwargs,
@@ -1466,6 +1480,11 @@ class Accelerator:
                 f"`device_placement` should be a list with {len(args)} elements (the number of objects passed)."
             )
 
+        kt_plugin = getattr(self.state, "kt_config", None)
+        kt_bypass_device_map = bool(
+            kt_plugin is not None and kt_plugin.enabled and kt_plugin.bypass_device_map_check
+        )
+
         for obj in args:
             # TODO: Look at enabling native TP training directly with a proper config
             if (
@@ -1473,6 +1492,7 @@ class Accelerator:
                 and self.verify_device_map(obj)
                 and self.distributed_type != DistributedType.NO
                 and os.environ.get("ACCELERATE_BYPASS_DEVICE_MAP", "false") != "true"
+                and not kt_bypass_device_map
             ):
                 raise ValueError(
                     "You can't train a model that has been loaded with `device_map='auto'` in any distributed mode."
@@ -1689,6 +1709,30 @@ class Accelerator:
         if model_index is None:
             return tuple(result)
 
+        # Register KT expert modules as ignored_modules for FSDP2.
+        # Only ignore the experts submodule (CPU-side, managed by KT kernel).
+        # The router (gate) and shared_experts remain FSDP2-managed.
+        kt_plugin = getattr(self.state, "kt_config", None)
+        if kt_plugin is not None and kt_plugin.enabled:
+            kt_wrappers = getattr(model, "_kt_wrappers", None)
+            if kt_wrappers is None:
+                _base = model
+                for _attr in ("base_model", "model"):
+                    _base = getattr(_base, _attr, None)
+                    if _base is None:
+                        break
+                    kt_wrappers = getattr(_base, "_kt_wrappers", None)
+                    if kt_wrappers is not None:
+                        break
+            if kt_wrappers is not None:
+                if self.state.fsdp_plugin.ignored_modules is None:
+                    self.state.fsdp_plugin.ignored_modules = []
+                for wrapper in kt_wrappers:
+                    experts_attr = getattr(wrapper, "_experts_attr", "experts")
+                    experts = getattr(wrapper, experts_attr, None)
+                    if experts is not None and experts not in self.state.fsdp_plugin.ignored_modules:
+                        self.state.fsdp_plugin.ignored_modules.append(experts)
+
         # Needs to be done first, to make sure AC + fully_shard will work as expected
         self.state.fsdp_plugin.set_auto_wrap_policy(model)
 
@@ -1794,11 +1838,29 @@ class Accelerator:
 
         self._models.append(model)
 
+        kt_plugin = getattr(self.state, "kt_config", None)
+        kt_bypass_device_map = bool(
+            kt_plugin is not None and kt_plugin.enabled and kt_plugin.bypass_device_map_check
+        )
+
+        if kt_plugin is not None and kt_plugin.enabled and kt_plugin.skip_device_placement:
+            device_placement = False
+
+        if kt_plugin is not None and kt_plugin.enabled:
+            if kt_plugin.require_single_process and self.num_processes != 1:
+                raise ValueError("KT plugin requires single-process execution (num_processes=1).")
+            if self.distributed_type not in kt_plugin.allowed_distributed_types:
+                raise ValueError(
+                    f"KT plugin does not allow distributed_type={self.distributed_type}. "
+                    f"Allowed: {kt_plugin.allowed_distributed_types}"
+                )
+
         # TODO: Look at enabling native TP training directly with a proper config
         if (
             self.verify_device_map(model)
             and self.distributed_type != DistributedType.NO
             and os.environ.get("ACCELERATE_BYPASS_DEVICE_MAP", "false") != "true"
+            and not kt_bypass_device_map
         ):
             raise ValueError(
                 "You can't train a model that has been loaded with `device_map='auto'` in any distributed mode."

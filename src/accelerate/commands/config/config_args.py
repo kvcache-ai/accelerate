@@ -198,6 +198,8 @@ class ClusterConfig(BaseConfig):
     parallelism_config: Optional[dict] = None
     # args for megatron_lm
     megatron_lm_config: Optional[dict] = None
+    # args for ktransformers
+    kt_config: Optional[dict] = None
     # args for mpirun
     mpirun_config: Optional[dict] = None
     # args for TPU
@@ -223,6 +225,8 @@ class ClusterConfig(BaseConfig):
             self.fsdp_config = {}
         if self.megatron_lm_config is None:
             self.megatron_lm_config = {}
+        if self.kt_config is None:
+            self.kt_config = {}
         if self.mpirun_config is None:
             self.mpirun_config = {}
         if self.fp8_config is None:

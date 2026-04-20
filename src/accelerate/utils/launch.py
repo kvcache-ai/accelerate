@@ -97,6 +97,54 @@ def setup_fp8_env(args: argparse.Namespace, current_env: dict[str, str]):
     return current_env
 
 
+def _apply_kt_config_to_env(args: argparse.Namespace, current_env: dict[str, str]) -> dict[str, str]:
+    """
+    Mirror `kt_config` entries from the accelerate config file into environment variables (following the FSDP/TP style)
+    so downstream code can detect KT before the user script starts.
+    """
+    kt_config = getattr(args, "kt_config", None)
+    if not kt_config:
+        return current_env
+
+    enabled = kt_config.get("enabled", True)
+    if "ACCELERATE_USE_KT" not in current_env and enabled is not None:
+        current_env["ACCELERATE_USE_KT"] = str(bool(enabled)).lower()
+
+    if not enabled:
+        return current_env
+
+    # Dict keys use kt_ prefix, matching KTConfig field names exactly.
+    mapping = {
+        "kt_backend": "ACCELERATE_KT_BACKEND",
+        "kt_num_gpu_experts": "ACCELERATE_KT_NUM_GPU_EXPERTS",
+        "kt_num_threads": "ACCELERATE_KT_NUM_THREADS",
+        "kt_tp_enabled": "ACCELERATE_KT_TP_ENABLED",
+        "kt_threadpool_count": "ACCELERATE_KT_THREADPOOL_COUNT",
+        "kt_max_cache_depth": "ACCELERATE_KT_MAX_CACHE_DEPTH",
+        "kt_weight_path": "ACCELERATE_KT_WEIGHT_PATH",
+        "kt_use_lora_experts": "ACCELERATE_KT_USE_LORA_EXPERTS",
+        "kt_lora_expert_num": "ACCELERATE_KT_LORA_EXPERT_NUM",
+        "kt_lora_expert_intermediate_size": "ACCELERATE_KT_LORA_EXPERT_INTERMEDIATE_SIZE",
+        "kt_lora_rank": "ACCELERATE_KT_LORA_RANK",
+        "kt_lora_alpha": "ACCELERATE_KT_LORA_ALPHA",
+        "kt_model_max_length": "ACCELERATE_KT_MODEL_MAX_LENGTH",
+        "kt_skip_expert_loading": "ACCELERATE_KT_SKIP_EXPERT_LOADING",
+        "kt_share_backward_bb": "ACCELERATE_KT_SHARE_BACKWARD_BB",
+    }
+
+    for key, env_key in mapping.items():
+        if env_key in current_env or key not in kt_config:
+            continue
+        value = kt_config[key]
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            value = str(value).lower()
+        current_env[env_key] = str(value)
+
+    return current_env
+
+
 def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
     """
     Prepares and returns the command list and an environment with the correct simple launcher environment variables.
@@ -195,6 +243,7 @@ def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> tuple[list[str]
     current_env["OMP_NUM_THREADS"] = str(args.num_cpu_threads_per_process)
     if args.enable_cpu_affinity:
         current_env["ACCELERATE_CPU_AFFINITY"] = "1"
+    current_env = _apply_kt_config_to_env(args, current_env)
     return cmd, current_env
 
 
@@ -396,6 +445,7 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> dict[str, str]:
     if args.use_parallelism_config:
         current_env = prepare_extend_env_parallelism_config(args, current_env)
 
+    current_env = _apply_kt_config_to_env(args, current_env)
     return current_env
 
 

@@ -510,6 +510,11 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
             tensor = tensor.contiguous()
         return tensor
 
+    def _is_dtensor(param):
+        """Check if a parameter is a DTensor (has device_mesh attribute).
+        Non-DTensor params (e.g., KT LoRA on CPU) are ignored by FSDP and handled separately."""
+        return hasattr(param, "device_mesh") and param.device_mesh is not None
+
     if accelerator.is_main_process:
         for param_name, sharded_param in meta_sharded_sd.items():
             if param_name not in full_sd:
@@ -518,6 +523,11 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
                     f"Full state dict has {len(full_sd)} keys, sharded has {len(meta_sharded_sd)} keys."
                 )
             full_param = full_sd[param_name]
+            if not _is_dtensor(sharded_param):
+                # Not a DTensor (e.g., KT LoRA params on CPU, ignored by FSDP).
+                # Keep on rank 0 only — no broadcast. Other ranks don't need them.
+                sharded_sd[param_name] = full_param.detach()
+                continue
             device_mesh = sharded_param.device_mesh
             full_param = full_param.detach().to(device_mesh.device_type)
             if isinstance(full_param, DTensor):
@@ -540,6 +550,10 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
     # We need this else to have a matching `broadcast` for all of the ranks, else we deadlock
     else:
         for param_name, sharded_param in meta_sharded_sd.items():
+            if not _is_dtensor(sharded_param):
+                # Not a DTensor (e.g., KT LoRA params) — rank 0 only, skip broadcast.
+                sharded_sd[param_name] = sharded_param
+                continue
             device_mesh = sharded_param.device_mesh
             full_tensor = torch.empty(sharded_param.size(), device=device_mesh.device_type, dtype=sharded_param.dtype)
             dist.broadcast(full_tensor, src=0, group=dist.group.WORLD)
@@ -580,15 +594,18 @@ def fsdp2_switch_optimizer_parameters(optimizer: torch.optim.Optimizer, mapping:
     accessor_mapping = {}
 
     accessor_mapping[DTensor] = "_local_tensor"
-    try:
-        for param_group in optimizer.param_groups:
-            param_group["params"] = [mapping[p.data_ptr] for p in param_group["params"]]
-    except KeyError:
-        # This shouldn't ever happen, but we want to fail here else training wouldn't be numerically correct
-        # This basically means that we're missing a mapping from the original parameter to the sharded parameter
-        raise KeyError(
-            "A parameter in the optimizer couldn't be switched to its sharded version. This breaks the training. Please raise an issue on GitHub."
-        )
+
+    # KT: params not in mapping (e.g., KT LoRA on CPU not sharded by FSDP2) are kept as-is.
+    for param_group in optimizer.param_groups:
+        new_params = []
+        for p in param_group["params"]:
+            ptr = p.data_ptr if not callable(getattr(p, "data_ptr", None)) else p.data_ptr()
+            if ptr in mapping:
+                new_params.append(mapping[ptr])
+            else:
+                # Keep original param (e.g., KT LoRA params on CPU not sharded by FSDP2)
+                new_params.append(p)
+        param_group["params"] = new_params
 
 
 def fsdp2_apply_ac(accelerator, model: torch.nn.Module):
