@@ -82,7 +82,7 @@ setup(
         "packaging>=20.0",
         "psutil",
         "pyyaml",
-        "torch>=2.0.0",
+        "torch>=2.10,<2.12",
         "huggingface_hub>=0.21.0",
         "safetensors>=0.4.3",
     ],
