@@ -40,7 +40,7 @@ from ..utils import (
 from ..utils.constants import DEEPSPEED_MULTINODE_LAUNCHERS
 from ..utils.other import get_free_port, is_port_in_use, merge_dicts
 from ..utils.versions import compare_versions
-from . import parse_flag_from_env
+from . import parse_flag_from_env, str_to_bool
 from .dataclasses import DistributedType, SageMakerDistributedType
 
 
@@ -97,49 +97,50 @@ def setup_fp8_env(args: argparse.Namespace, current_env: dict[str, str]):
     return current_env
 
 
+_KT_CONFIG_BOOL_KEYS = {
+    "enabled",
+    "kt_skip_expert_loading",
+    "kt_share_backward_bb",
+    "kt_tp_enabled",
+    "kt_use_lora_experts",
+}
+
+
+def _convert_kt_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return str_to_bool(value, to_bool=True)
+    return bool(value)
+
+
 def _apply_kt_config_to_env(args: argparse.Namespace, current_env: dict[str, str]) -> dict[str, str]:
     """
-    Mirror `kt_config` entries from the accelerate config file into environment variables (following the FSDP/TP style)
-    so downstream code can detect KT before the user script starts.
+    Mirror `kt_config` entries from the accelerate config file into environment variables so downstream code can detect
+    KTransformers before the user script starts.
     """
     kt_config = getattr(args, "kt_config", None)
     if not kt_config:
         return current_env
 
-    enabled = kt_config.get("enabled", True)
-    if "ACCELERATE_USE_KT" not in current_env and enabled is not None:
-        current_env["ACCELERATE_USE_KT"] = str(bool(enabled)).lower()
+    enabled = _convert_kt_bool(kt_config.get("enabled", True))
+    if "ACCELERATE_USE_KT" not in current_env:
+        current_env["ACCELERATE_USE_KT"] = str(enabled).lower()
 
     if not enabled:
         return current_env
 
-    # Dict keys use kt_ prefix, matching KTConfig field names exactly.
-    mapping = {
-        "kt_backend": "ACCELERATE_KT_BACKEND",
-        "kt_num_gpu_experts": "ACCELERATE_KT_NUM_GPU_EXPERTS",
-        "kt_num_threads": "ACCELERATE_KT_NUM_THREADS",
-        "kt_tp_enabled": "ACCELERATE_KT_TP_ENABLED",
-        "kt_threadpool_count": "ACCELERATE_KT_THREADPOOL_COUNT",
-        "kt_max_cache_depth": "ACCELERATE_KT_MAX_CACHE_DEPTH",
-        "kt_weight_path": "ACCELERATE_KT_WEIGHT_PATH",
-        "kt_use_lora_experts": "ACCELERATE_KT_USE_LORA_EXPERTS",
-        "kt_lora_expert_num": "ACCELERATE_KT_LORA_EXPERT_NUM",
-        "kt_lora_expert_intermediate_size": "ACCELERATE_KT_LORA_EXPERT_INTERMEDIATE_SIZE",
-        "kt_lora_rank": "ACCELERATE_KT_LORA_RANK",
-        "kt_lora_alpha": "ACCELERATE_KT_LORA_ALPHA",
-        "kt_model_max_length": "ACCELERATE_KT_MODEL_MAX_LENGTH",
-        "kt_skip_expert_loading": "ACCELERATE_KT_SKIP_EXPERT_LOADING",
-        "kt_share_backward_bb": "ACCELERATE_KT_SHARE_BACKWARD_BB",
-    }
-
-    for key, env_key in mapping.items():
-        if env_key in current_env or key not in kt_config:
+    # Dict keys use the kt_ prefix, matching KTConfig field names exactly.
+    for key, value in kt_config.items():
+        if key == "enabled" or not key.startswith("kt_"):
             continue
-        value = kt_config[key]
+        env_key = f"ACCELERATE_{key.upper()}"
+        if env_key in current_env:
+            continue
         if value is None:
             continue
-        if isinstance(value, bool):
-            value = str(value).lower()
+        if key in _KT_CONFIG_BOOL_KEYS or isinstance(value, bool):
+            value = str(_convert_kt_bool(value)).lower()
         current_env[env_key] = str(value)
 
     return current_env

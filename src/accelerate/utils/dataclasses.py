@@ -3042,22 +3042,22 @@ class KTransformersPlugin:
     Plugin to enable KTransformers MoE wrapping inside Accelerate.
 
     Follows the DeepSpeed pattern: only accelerate-framework interaction fields
-    are defined here. KT-kernel-specific configuration is passed through the
-    opaque ``kt_config`` field (similar to ``DeepSpeedPlugin.hf_ds_config``).
+    are defined here. KTransformers kernel-specific configuration is passed through the
+    opaque `kt_config` field (similar to `DeepSpeedPlugin.hf_ds_config`).
 
     Args:
         enabled (`bool`, defaults to env ACCELERATE_USE_KT or False):
-            Whether to enable KT wrapping.
+            Whether to enable KTransformers wrapping.
         kt_config (`Any`, defaults to None):
-            KT-kernel configuration. Accepts a ``kt_kernel.sft.KTConfig`` object
-            or a dict (passed to ``KTConfig(**dict)``). If None, a default
-            ``KTConfig()`` is created (reads ACCELERATE_KT_* env vars).
-        bypass_device_map_check (`bool`, defaults to True):
+            KTransformers kernel configuration. Accepts a `kt_kernel.sft.KTConfig` object
+            or a dict (passed to `KTConfig(**dict)`). If None and the plugin is enabled, a default `KTConfig()` is
+            created (reads ACCELERATE_KT_* env vars).
+        bypass_device_map_check (`bool`, defaults to False):
             Skip Accelerate's device_map validation.
         skip_device_placement (`bool`, defaults to True):
-            Force device_placement=False for models wrapped by KT.
+            Force device_placement=False for models wrapped by KTransformers.
         allowed_distributed_types (`tuple[DistributedType, ...]`):
-            Allowed distributed types when KT is enabled.
+            Allowed distributed types when KTransformers is enabled.
         require_single_process (`bool`, defaults to False):
             Require single-process execution.
     """
@@ -3066,44 +3066,71 @@ class KTransformersPlugin:
     kt_config: Any = None
     bypass_device_map_check: bool | None = None
     skip_device_placement: bool | None = None
-    allowed_distributed_types: tuple[DistributedType, ...] = (DistributedType.NO, DistributedType.FSDP, DistributedType.MULTI_GPU)
+    allowed_distributed_types: tuple[DistributedType, ...] = (
+        DistributedType.NO,
+        DistributedType.FSDP,
+        DistributedType.MULTI_GPU,
+    )
     require_single_process: bool = False
 
     def __post_init__(self):
         if self.enabled is None:
             self.enabled = parse_flag_from_env("ACCELERATE_USE_KT", default=False)
 
-        # Resolve kt_config: dict → KTConfig, None → default KTConfig
+        # Resolve kt_config: dict to KTConfig, None to default KTConfig.
         if self.kt_config is None:
-            try:
-                from kt_kernel.sft import KTConfig
+            if self.enabled:
+                try:
+                    from kt_kernel.sft import KTConfig
+                except ImportError as error:
+                    raise ImportError("Using KTransformers requires `kt-kernel` to be installed.") from error
+
                 self.kt_config = KTConfig()
-            except ImportError:
-                self.kt_config = None
         elif isinstance(self.kt_config, dict):
             try:
                 from kt_kernel.sft import KTConfig
-                self.kt_config = KTConfig(**self.kt_config)
-            except ImportError:
-                pass  # keep as dict if kt_kernel not installed
+            except ImportError as error:
+                raise ImportError("Using KTransformers requires `kt-kernel` to be installed.") from error
 
-        # Set skip_expert_loading default when enabled
+            self.kt_config = KTConfig(**self.kt_config)
+
+        # Set skip_expert_loading default when enabled.
         if self.kt_config is not None and self.enabled:
             if getattr(self.kt_config, "kt_skip_expert_loading", None) is None:
                 try:
                     self.kt_config.kt_skip_expert_loading = True
-                except Exception:
+                except AttributeError:
                     pass
 
         if self.bypass_device_map_check is None:
-            self.bypass_device_map_check = parse_flag_from_env(
-                "ACCELERATE_KT_BYPASS_DEVICE_MAP", default=True
-            )
+            self.bypass_device_map_check = parse_flag_from_env("ACCELERATE_KT_BYPASS_DEVICE_MAP", default=False)
 
         if self.skip_device_placement is None:
-            self.skip_device_placement = parse_flag_from_env(
-                "ACCELERATE_KT_SKIP_DEVICE_PLACEMENT", default=True
-            )
+            self.skip_device_placement = parse_flag_from_env("ACCELERATE_KT_SKIP_DEVICE_PLACEMENT", default=True)
+
+    def get_fsdp_ignored_modules(self, model):
+        ignored_modules = []
+        kt_wrappers = getattr(model, "_kt_wrappers", None)
+        if kt_wrappers is None:
+            base_model = model
+            for attr in ("base_model", "model"):
+                base_model = getattr(base_model, attr, None)
+                if base_model is None:
+                    break
+                kt_wrappers = getattr(base_model, "_kt_wrappers", None)
+                if kt_wrappers is not None:
+                    break
+
+        if kt_wrappers is None:
+            return ignored_modules
+
+        for wrapper in kt_wrappers:
+            experts_attr = getattr(wrapper, "_experts_attr", "experts")
+            experts = getattr(wrapper, experts_attr, None)
+            if experts is not None:
+                ignored_modules.append(experts)
+
+        return ignored_modules
 
 
 @dataclass

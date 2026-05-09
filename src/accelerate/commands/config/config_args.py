@@ -198,7 +198,7 @@ class ClusterConfig(BaseConfig):
     parallelism_config: Optional[dict] = None
     # args for megatron_lm
     megatron_lm_config: Optional[dict] = None
-    # args for ktransformers
+    # args for KTransformers
     kt_config: Optional[dict] = None
     # args for mpirun
     mpirun_config: Optional[dict] = None

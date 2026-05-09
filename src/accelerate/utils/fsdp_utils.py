@@ -464,6 +464,18 @@ def ensure_weights_retied(param_init_fn, model: torch.nn.Module, device: torch.d
     return param_init_fn_tied_param
 
 
+def _get_fsdp2_ignored_tensor_names(model: torch.nn.Module, fsdp2_plugin) -> set[str]:
+    ignored_tensors = set(getattr(fsdp2_plugin, "ignored_params", set()) or set())
+    for module in getattr(fsdp2_plugin, "ignored_modules", None) or []:
+        ignored_tensors.update(module.parameters(recurse=True))
+        ignored_tensors.update(module.buffers(recurse=True))
+
+    ignored_tensor_ids = {id(tensor) for tensor in ignored_tensors}
+    ignored_names = {name for name, tensor in model.named_parameters() if id(tensor) in ignored_tensor_ids}
+    ignored_names.update({name for name, tensor in model.named_buffers() if id(tensor) in ignored_tensor_ids})
+    return ignored_names
+
+
 def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dict, cpu_offload: bool = False):
     """
     Loads the full state dict (could be only on rank 0) into the sharded model. This is done by broadcasting the
@@ -483,6 +495,8 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
     # Model was previously copied to meta device
     meta_sharded_sd = model.state_dict()
     sharded_sd = {}
+
+    ignored_tensor_names = _get_fsdp2_ignored_tensor_names(model, accelerator.state.fsdp_plugin)
 
     # Rank 0 distributes the full state dict to other ranks
     def _infer_parameter_dtype(model, param_name, empty_param):
@@ -511,8 +525,10 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
         return tensor
 
     def _is_dtensor(param):
-        """Check if a parameter is a DTensor (has device_mesh attribute).
-        Non-DTensor params (e.g., KT LoRA on CPU) are ignored by FSDP and handled separately."""
+        """Check if a parameter is a DTensor.
+
+        Non-DTensor entries are only expected for tensors explicitly ignored by FSDP2.
+        """
         return hasattr(param, "device_mesh") and param.device_mesh is not None
 
     if accelerator.is_main_process:
@@ -524,8 +540,12 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
                 )
             full_param = full_sd[param_name]
             if not _is_dtensor(sharded_param):
-                # Not a DTensor (e.g., KT LoRA params on CPU, ignored by FSDP).
-                # Keep on rank 0 only — no broadcast. Other ranks don't need them.
+                if param_name not in ignored_tensor_names:
+                    raise TypeError(
+                        f"Expected FSDP2 state dict entry '{param_name}' to be a DTensor unless it belongs to "
+                        "`ignored_modules` or `ignored_params`."
+                    )
+                # Explicitly ignored tensors are kept on rank 0 only.
                 sharded_sd[param_name] = full_param.detach()
                 continue
             device_mesh = sharded_param.device_mesh
@@ -551,7 +571,12 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
     else:
         for param_name, sharded_param in meta_sharded_sd.items():
             if not _is_dtensor(sharded_param):
-                # Not a DTensor (e.g., KT LoRA params) — rank 0 only, skip broadcast.
+                if param_name not in ignored_tensor_names:
+                    raise TypeError(
+                        f"Expected FSDP2 state dict entry '{param_name}' to be a DTensor unless it belongs to "
+                        "`ignored_modules` or `ignored_params`."
+                    )
+                # Explicitly ignored tensors are kept on rank 0 only, so skip broadcast.
                 sharded_sd[param_name] = sharded_param
                 continue
             device_mesh = sharded_param.device_mesh
@@ -574,7 +599,9 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
     return model
 
 
-def fsdp2_switch_optimizer_parameters(optimizer: torch.optim.Optimizer, mapping: dict):
+def fsdp2_switch_optimizer_parameters(
+    optimizer: torch.optim.Optimizer, mapping: dict, ignored_params: set[torch.nn.Parameter] | None = None
+):
     """
     Switches the parameters of the optimizer to new ones (sharded parameters in usual case). This function modifies the
     optimizer in-place.
@@ -582,12 +609,13 @@ def fsdp2_switch_optimizer_parameters(optimizer: torch.optim.Optimizer, mapping:
     Args:
         optimizer (`torch.optim.Optimizer`): Optimizer instance which contains the original model parameters
         mapping (`dict`): Mapping from the original parameter (specified by `data_ptr`) to the sharded parameter
+        ignored_params (`set[torch.nn.Parameter]`, *optional*):
+            Parameters that are intentionally not sharded by FSDP2 and should be kept as-is.
 
     Raises:
         KeyError:
-            If a parameter in the optimizer couldn't be switched to its sharded version. This should never happen and
-            indicates a bug. If we kept the original params instead of raising, the training wouldn't be numerically
-            correct and weights wouldn't get updated.
+            If a parameter in the optimizer couldn't be switched to its sharded version and is not explicitly ignored.
+            This should never happen and indicates a bug.
     """
     from torch.distributed.tensor import DTensor
 
@@ -595,16 +623,20 @@ def fsdp2_switch_optimizer_parameters(optimizer: torch.optim.Optimizer, mapping:
 
     accessor_mapping[DTensor] = "_local_tensor"
 
-    # KT: params not in mapping (e.g., KT LoRA on CPU not sharded by FSDP2) are kept as-is.
+    ignored_param_ids = {id(param) for param in ignored_params or set()}
     for param_group in optimizer.param_groups:
         new_params = []
         for p in param_group["params"]:
             ptr = p.data_ptr if not callable(getattr(p, "data_ptr", None)) else p.data_ptr()
             if ptr in mapping:
                 new_params.append(mapping[ptr])
-            else:
-                # Keep original param (e.g., KT LoRA params on CPU not sharded by FSDP2)
+            elif id(p) in ignored_param_ids:
                 new_params.append(p)
+            else:
+                raise KeyError(
+                    "A parameter in the optimizer couldn't be switched to its sharded version. This breaks the "
+                    "training. Please raise an issue on GitHub."
+                )
         param_group["params"] = new_params
 
 
