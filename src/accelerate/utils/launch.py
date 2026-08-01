@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -112,6 +113,15 @@ def _apply_kt_config_to_env(args: argparse.Namespace, current_env: dict[str, str
 
     if not enabled:
         return current_env
+
+    activation_policy = kt_config.get("kt_activation_policy")
+    activation_policy_env = "ACCELERATE_KT_ACTIVATION_POLICY"
+    if activation_policy_env not in current_env and activation_policy is not None:
+        current_env[activation_policy_env] = json.dumps(
+            activation_policy,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
     # Dict keys use kt_ prefix, matching KTConfig field names exactly.
     mapping = {

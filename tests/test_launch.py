@@ -15,7 +15,54 @@
 import argparse
 import unittest
 
-from accelerate.utils.launch import prepare_multi_gpu_env
+from accelerate.utils.launch import _apply_kt_config_to_env, prepare_multi_gpu_env
+
+
+class TestApplyKTConfigToEnv(unittest.TestCase):
+    def test_serializes_activation_policy_for_workers(self):
+        args = argparse.Namespace(
+            kt_config={
+                "enabled": True,
+                "kt_activation_policy": {"cpu": "retain", "gpu": "recompute"},
+            }
+        )
+
+        env = _apply_kt_config_to_env(args, {})
+
+        self.assertEqual(env["ACCELERATE_USE_KT"], "true")
+        self.assertEqual(
+            env["ACCELERATE_KT_ACTIVATION_POLICY"],
+            '{"cpu":"retain","gpu":"recompute"}',
+        )
+
+    def test_explicit_worker_env_takes_precedence(self):
+        args = argparse.Namespace(
+            kt_config={
+                "enabled": True,
+                "kt_activation_policy": {"cpu": "retain", "gpu": "recompute"},
+            }
+        )
+        existing = '{"cpu":"recompute","gpu":"recompute"}'
+
+        env = _apply_kt_config_to_env(
+            args,
+            {"ACCELERATE_KT_ACTIVATION_POLICY": existing},
+        )
+
+        self.assertEqual(env["ACCELERATE_KT_ACTIVATION_POLICY"], existing)
+
+    def test_disabled_kt_does_not_forward_activation_policy(self):
+        args = argparse.Namespace(
+            kt_config={
+                "enabled": False,
+                "kt_activation_policy": {"cpu": "retain", "gpu": "recompute"},
+            }
+        )
+
+        env = _apply_kt_config_to_env(args, {})
+
+        self.assertEqual(env["ACCELERATE_USE_KT"], "false")
+        self.assertNotIn("ACCELERATE_KT_ACTIVATION_POLICY", env)
 
 
 class TestPrepareMultiGpuEnv(unittest.TestCase):
