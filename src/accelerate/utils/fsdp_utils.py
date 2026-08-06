@@ -515,6 +515,13 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
         Non-DTensor params (e.g., KT LoRA on CPU) are ignored by FSDP and handled separately."""
         return hasattr(param, "device_mesh") and param.device_mesh is not None
 
+    def _is_buffer(param_name):
+        try:
+            model.get_buffer(param_name)
+        except AttributeError:
+            return False
+        return True
+
     if accelerator.is_main_process:
         for param_name, sharded_param in meta_sharded_sd.items():
             if param_name not in full_sd:
@@ -524,6 +531,11 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
                 )
             full_param = full_sd[param_name]
             if not _is_dtensor(sharded_param):
+                if _is_buffer(param_name):
+                    full_buffer = full_param.detach().to(accelerator.device).contiguous()
+                    dist.broadcast(full_buffer, src=0, group=dist.group.WORLD)
+                    sharded_sd[param_name] = full_buffer
+                    continue
                 # Not a DTensor (e.g., KT LoRA params on CPU, ignored by FSDP).
                 # Keep on rank 0 only — no broadcast. Other ranks don't need them.
                 sharded_sd[param_name] = full_param.detach()
@@ -551,6 +563,13 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
     else:
         for param_name, sharded_param in meta_sharded_sd.items():
             if not _is_dtensor(sharded_param):
+                if _is_buffer(param_name):
+                    full_buffer = torch.empty(
+                        sharded_param.size(), device=accelerator.device, dtype=sharded_param.dtype
+                    )
+                    dist.broadcast(full_buffer, src=0, group=dist.group.WORLD)
+                    sharded_sd[param_name] = full_buffer
+                    continue
                 # Not a DTensor (e.g., KT LoRA params) — rank 0 only, skip broadcast.
                 sharded_sd[param_name] = sharded_param
                 continue
