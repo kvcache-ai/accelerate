@@ -123,7 +123,7 @@ def _apply_kt_config_to_env(args: argparse.Namespace, current_env: dict[str, str
             separators=(",", ":"),
         )
 
-    # Dict keys use kt_ prefix, matching KTConfig field names exactly.
+    # Keys mirror KTConfig except for the Transformers-only non-expert path.
     mapping = {
         "kt_backend": "ACCELERATE_KT_BACKEND",
         "kt_num_gpu_experts": "ACCELERATE_KT_NUM_GPU_EXPERTS",
@@ -132,14 +132,21 @@ def _apply_kt_config_to_env(args: argparse.Namespace, current_env: dict[str, str
         "kt_threadpool_count": "ACCELERATE_KT_THREADPOOL_COUNT",
         "kt_max_cache_depth": "ACCELERATE_KT_MAX_CACHE_DEPTH",
         "kt_weight_path": "ACCELERATE_KT_WEIGHT_PATH",
+        "kt_expert_weight_format": "ACCELERATE_KT_EXPERT_WEIGHT_FORMAT",
+        "kt_weight_lifecycle": "ACCELERATE_KT_WEIGHT_LIFECYCLE",
+        "kt_expert_checkpoint_path": "ACCELERATE_KT_EXPERT_CHECKPOINT_PATH",
+        "kt_non_expert_weight_path": "ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH",
         "kt_use_lora_experts": "ACCELERATE_KT_USE_LORA_EXPERTS",
         "kt_lora_expert_num": "ACCELERATE_KT_LORA_EXPERT_NUM",
         "kt_lora_expert_intermediate_size": "ACCELERATE_KT_LORA_EXPERT_INTERMEDIATE_SIZE",
         "kt_lora_rank": "ACCELERATE_KT_LORA_RANK",
         "kt_lora_alpha": "ACCELERATE_KT_LORA_ALPHA",
+        "kt_lora_dropout": "ACCELERATE_KT_LORA_DROPOUT",
+        "kt_train_mode": "ACCELERATE_KT_TRAIN_MODE",
         "kt_model_max_length": "ACCELERATE_KT_MODEL_MAX_LENGTH",
         "kt_skip_expert_loading": "ACCELERATE_KT_SKIP_EXPERT_LOADING",
         "kt_share_backward_bb": "ACCELERATE_KT_SHARE_BACKWARD_BB",
+        "kt_force_fused_expert_lora": "ACCELERATE_KT_FORCE_FUSED_EXPERT_LORA",
     }
 
     for key, env_key in mapping.items():
