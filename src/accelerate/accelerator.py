@@ -1429,6 +1429,16 @@ class Accelerator:
         # Return the unprocessed object if previous criteria was not met
         return obj
 
+    def _validate_kt_distributed_setup(self, objects) -> None:
+        if not any(isinstance(obj, torch.nn.Module) for obj in objects):
+            return
+
+        kt_plugin = getattr(self.state, "kt_config", None)
+        if kt_plugin is not None and kt_plugin.enabled:
+            kt_plugin.validate_distributed_setup(
+                self.distributed_type, is_fsdp2=self.is_fsdp2, num_processes=self.num_processes
+            )
+
     def prepare(self, *args, device_placement=None):
         """
         Prepare all objects passed in `args` for distributed training and mixed precision, then return them in the same
@@ -1479,6 +1489,8 @@ class Accelerator:
         ... )
         ```
         """
+        self._validate_kt_distributed_setup(args)
+
         if device_placement is None:
             device_placement = [None for _ in args]
         elif self.distributed_type in (DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM):
@@ -1936,22 +1948,15 @@ class Accelerator:
         if device_placement is None:
             device_placement = self.device_placement and self.distributed_type != DistributedType.FSDP
 
-        self._models.append(model)
-
         kt_plugin = getattr(self.state, "kt_config", None)
         kt_bypass_device_map = bool(kt_plugin is not None and kt_plugin.enabled and kt_plugin.bypass_device_map_check)
 
+        self._validate_kt_distributed_setup((model,))
+
+        self._models.append(model)
+
         if kt_plugin is not None and kt_plugin.enabled and kt_plugin.skip_device_placement:
             device_placement = False
-
-        if kt_plugin is not None and kt_plugin.enabled:
-            if kt_plugin.require_single_process and self.num_processes != 1:
-                raise ValueError("KT plugin requires single-process execution (num_processes=1).")
-            if self.distributed_type not in kt_plugin.allowed_distributed_types:
-                raise ValueError(
-                    f"KT plugin does not allow distributed_type={self.distributed_type}. "
-                    f"Allowed: {kt_plugin.allowed_distributed_types}"
-                )
 
         # TODO: Look at enabling native TP training directly with a proper config
         if (

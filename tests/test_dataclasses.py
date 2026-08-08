@@ -17,7 +17,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from accelerate.parallelism_config import ParallelismConfig
-from accelerate.utils import KTransformersPlugin, patch_environment
+from accelerate.utils import DistributedType, KTransformersPlugin, patch_environment
 from accelerate.utils.constants import (
     BETA_CP_AVAILABLE_PYTORCH_VERSION,
     BETA_SP_AVAILABLE_DEEPSPEED_VERSION,
@@ -40,6 +40,20 @@ def test_ktransformers_plugin_does_not_materialize_default_runtime_config():
     plugin = KTransformersPlugin(enabled=True)
 
     assert plugin.kt_config is None
+
+
+def test_ktransformers_plugin_allows_multi_process_fsdp2():
+    plugin = KTransformersPlugin(enabled=True)
+
+    plugin.validate_distributed_setup(DistributedType.FSDP, is_fsdp2=True, num_processes=2)
+
+
+def test_ktransformers_plugin_allow_list_cannot_broaden_distributed_contract():
+    with pytest.raises(ValueError, match="cannot include.*MULTI_GPU"):
+        KTransformersPlugin(
+            enabled=True,
+            allowed_distributed_types=(DistributedType.NO, DistributedType.FSDP, DistributedType.MULTI_GPU),
+        )
 
 
 def _should_skip_cp_test(cp_size):
