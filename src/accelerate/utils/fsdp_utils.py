@@ -55,6 +55,17 @@ def disable_fsdp_ram_efficient_loading():
 
 def _get_model_state_dict(model, adapter_only=False, sd_options=None):
     if adapter_only and is_peft_model(model):
+        if sd_options is not None:
+            from torch.distributed.checkpoint.state_dict import get_model_state_dict
+
+            adapter_options = copy.copy(sd_options)
+            adapter_options.ignore_frozen_params = True
+            state_dict = get_model_state_dict(model, options=adapter_options)
+            adapter_names = _fsdp2_adapter_parameter_names(model)
+            state_dict = {name: value for name, value in state_dict.items() if name in adapter_names}
+            _validate_fsdp2_adapter_state_dict(model, state_dict, adapter_options)
+            return state_dict
+
         from peft import get_peft_model_state_dict
 
         return get_peft_model_state_dict(model, adapter_name=model.active_adapter)
@@ -70,6 +81,15 @@ def _get_model_state_dict(model, adapter_only=False, sd_options=None):
 
 def _set_model_state_dict(model, state_dict, adapter_only=False, sd_options=None):
     if adapter_only and is_peft_model(model):
+        if sd_options is not None:
+            from torch.distributed.checkpoint.state_dict import set_model_state_dict
+
+            adapter_options = copy.copy(sd_options)
+            adapter_options.ignore_frozen_params = True
+            adapter_options.strict = False
+            _validate_fsdp2_adapter_state_dict(model, state_dict, adapter_options)
+            return set_model_state_dict(model, state_dict, options=adapter_options)
+
         from peft import set_peft_model_state_dict
 
         return set_peft_model_state_dict(model, state_dict, adapter_name=model.active_adapter)
@@ -107,6 +127,34 @@ def _synchronize_state_dict_preflight(local_error):
     errors = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(errors, local_error)
     return tuple(f"rank {rank}: {error}" for rank, error in enumerate(errors) if error is not None)
+
+
+def _fsdp2_adapter_parameter_names(model):
+    return {name for name, parameter in model.named_parameters(remove_duplicate=False) if parameter.requires_grad}
+
+
+def _validate_fsdp2_adapter_state_dict(model, state_dict, options):
+    expected_names = _fsdp2_adapter_parameter_names(model)
+    rank0_broadcast = (
+        options.full_state_dict
+        and options.broadcast_from_rank0
+        and torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    )
+    should_have_state = not rank0_broadcast or torch.distributed.get_rank() == 0
+    local_error = None
+    if should_have_state and set(state_dict) != expected_names:
+        local_error = (
+            "adapter state keys do not match the trainable model parameters: "
+            f"missing={sorted(expected_names.difference(state_dict))}, "
+            f"unexpected={sorted(set(state_dict).difference(expected_names))}"
+        )
+    elif not should_have_state and state_dict:
+        local_error = "non-owner rank received a full adapter state dict"
+
+    errors = _synchronize_state_dict_preflight(local_error)
+    if errors:
+        raise RuntimeError(f"FSDP2 adapter state-dict preflight failed: {'; '.join(errors)}")
 
 
 def _get_fsdp2_model_state_dict(model, adapter_only=False, excluded_parameter_names=()):

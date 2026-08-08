@@ -237,6 +237,73 @@ def _run_two_rank_gradient_clip_checks(rank, world_size, rendezvous_path):
         dist.destroy_process_group()
 
 
+def _run_two_rank_adapter_checkpoint_checks(rank, world_size, rendezvous_path, output_dir):
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{rendezvous_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        from torch.distributed.fsdp import fully_shard
+        from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
+
+        from accelerate.utils.fsdp_utils import load_fsdp_model, save_fsdp_model
+
+        model = AdapterStateModel()
+        fully_shard(model)
+        with torch.no_grad():
+            model.adapter.to_local().fill_(rank + 3)
+        expected_adapter = model.adapter.full_tensor().detach().clone()
+
+        plugin = SimpleNamespace(
+            fsdp_version=2,
+            state_dict_type=StateDictType.FULL_STATE_DICT,
+            state_dict_config=SimpleNamespace(offload_to_cpu=False, rank0_only=False),
+            optim_state_dict_config=None,
+        )
+        accelerator = SimpleNamespace(
+            num_processes=world_size,
+            process_index=rank,
+            is_fsdp2=True,
+            is_main_process=rank == 0,
+            wait_for_everyone=dist.barrier,
+        )
+
+        with (
+            patch("accelerate.utils.fsdp_utils.is_peft_model", return_value=True),
+            patch("accelerate.utils.fsdp_utils.logger.info"),
+        ):
+            save_fsdp_model(plugin, accelerator, model, output_dir, adapter_only=True)
+            dist.barrier()
+
+            checkpoint_path = os.path.join(output_dir, "pytorch_model_fsdp.bin")
+            if rank == 0:
+                saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+                assert set(saved) == {"adapter"}
+                torch.testing.assert_close(saved["adapter"], expected_adapter)
+                assert os.path.getsize(checkpoint_path) < 64 * 1024
+
+            with torch.no_grad():
+                model.adapter.to_local().fill_(-7)
+                model.frozen.to_local().fill_(rank + 20)
+            expected_mutated_base = model.frozen.full_tensor().detach().clone()
+
+            load_fsdp_model(plugin, accelerator, model, output_dir, adapter_only=True)
+            torch.testing.assert_close(model.adapter.full_tensor(), expected_adapter)
+            torch.testing.assert_close(model.frozen.full_tensor(), expected_mutated_base)
+
+            dist.barrier()
+            if rank == 0:
+                torch.save({}, checkpoint_path)
+            dist.barrier()
+            with pytest.raises(RuntimeError, match="rank 0: adapter state keys do not match"):
+                load_fsdp_model(plugin, accelerator, model, output_dir, adapter_only=True)
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.mark.parametrize("is_main_process", [True, False])
 def test_fsdp2_load_full_state_dict_materializes_ordinary_parameters_and_buffers(is_main_process):
     model = ModelWithPersistentBuffer()
@@ -673,3 +740,16 @@ def test_fsdp2_combined_gradient_clipping_is_symmetric_across_two_ranks():
     with tempfile.TemporaryDirectory() as temporary_directory:
         rendezvous_path = f"{temporary_directory}/rendezvous"
         mp.spawn(_run_two_rank_gradient_clip_checks, args=(2, rendezvous_path), nprocs=2, join=True)
+
+
+@pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires torch.distributed gloo")
+def test_fsdp2_adapter_checkpoint_round_trip_is_exact_across_two_ranks():
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        rendezvous_path = f"{temporary_directory}/rendezvous"
+        output_dir = f"{temporary_directory}/checkpoint"
+        mp.spawn(
+            _run_two_rank_adapter_checkpoint_checks,
+            args=(2, rendezvous_path, output_dir),
+            nprocs=2,
+            join=True,
+        )
