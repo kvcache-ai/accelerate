@@ -100,6 +100,96 @@ def _prepare_sd_options(fsdp_plugin):
     return sd_options
 
 
+def _synchronize_state_dict_preflight(local_error):
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return (local_error,) if local_error is not None else ()
+
+    errors = [None] * torch.distributed.get_world_size()
+    torch.distributed.all_gather_object(errors, local_error)
+    return tuple(f"rank {rank}: {error}" for rank, error in enumerate(errors) if error is not None)
+
+
+def _get_fsdp2_model_state_dict(model, adapter_only=False, excluded_parameter_names=()):
+    """Collect an FSDP2 full state dict without gathering frozen parameters in adapter-only mode."""
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+    local_error = None
+    excluded_names = ()
+    named_parameters = {}
+    try:
+        if isinstance(excluded_parameter_names, str):
+            raise TypeError("`excluded_parameter_names` must be an iterable of parameter names, not a string.")
+
+        excluded_names = tuple(sorted(set(excluded_parameter_names)))
+        if any(not isinstance(name, str) for name in excluded_names):
+            raise TypeError("`excluded_parameter_names` must contain only strings.")
+
+        named_parameters = dict(model.named_parameters(remove_duplicate=False))
+        missing_names = sorted(set(excluded_names).difference(named_parameters))
+        if missing_names:
+            raise ValueError(f"Excluded parameter names were not found in the model: {missing_names}")
+    except Exception as error:
+        local_error = f"{type(error).__name__}: {error}"
+
+    errors = _synchronize_state_dict_preflight(local_error)
+    if errors:
+        raise RuntimeError(f"FSDP2 state-dict preflight failed: {'; '.join(errors)}")
+
+    signature = (bool(adapter_only), excluded_names)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        signatures = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(signatures, signature)
+        if any(candidate != signature for candidate in signatures):
+            raise RuntimeError(
+                "FSDP2 state-dict selection must use identical `adapter_only` and "
+                "`excluded_parameter_names` values on every rank."
+            )
+
+    included_names = {
+        name for name, parameter in named_parameters.items() if parameter.requires_grad and name not in excluded_names
+    }
+    excluded_parameters = {id(named_parameters[name]): named_parameters[name] for name in excluded_names}
+    original_requires_grad = {identity: parameter.requires_grad for identity, parameter in excluded_parameters.items()}
+
+    mutation_error = None
+    if adapter_only:
+        try:
+            # DCP's frozen-parameter filter expects every frozen parameter to be present in ``model.state_dict()``.
+            # Some integrations intentionally omit placeholder parameters, so make explicitly excluded placeholders
+            # visible to the filter and remove them from the result below.
+            for parameter in excluded_parameters.values():
+                parameter.requires_grad_(True)
+        except Exception as error:
+            mutation_error = f"{type(error).__name__}: {error}"
+
+    errors = _synchronize_state_dict_preflight(mutation_error)
+    if errors:
+        for identity, parameter in excluded_parameters.items():
+            parameter.requires_grad_(original_requires_grad[identity])
+        raise RuntimeError(f"FSDP2 state-dict preflight failed while preparing exclusions: {'; '.join(errors)}")
+
+    try:
+        state_dict = get_model_state_dict(
+            model,
+            options=StateDictOptions(
+                full_state_dict=True,
+                cpu_offload=True,
+                ignore_frozen_params=adapter_only,
+                broadcast_from_rank0=True,
+            ),
+        )
+    finally:
+        for identity, parameter in excluded_parameters.items():
+            parameter.requires_grad_(original_requires_grad[identity])
+
+    if adapter_only:
+        return {name: value for name, value in state_dict.items() if name in included_names}
+
+    for name in excluded_names:
+        state_dict.pop(name, None)
+    return state_dict
+
+
 def save_fsdp_model(fsdp_plugin, accelerator, model, output_dir, model_index=0, adapter_only=False):
     # Note: We import here to reduce import time from general modules, and isolate outside dependencies
     import torch.distributed.checkpoint as dist_cp
@@ -511,11 +601,10 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
         return tensor
 
     def _is_dtensor(param):
-        """Check if a parameter is a DTensor (has device_mesh attribute).
-        Non-DTensor params (e.g., KT LoRA on CPU) are ignored by FSDP and handled separately."""
+        """Check whether a state-dict value is managed by FSDP2."""
         return hasattr(param, "device_mesh") and param.device_mesh is not None
 
-    def _is_buffer(param_name):
+    def _is_persistent_buffer(param_name):
         try:
             model.get_buffer(param_name)
         except AttributeError:
@@ -531,13 +620,14 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
                 )
             full_param = full_sd[param_name]
             if not _is_dtensor(sharded_param):
-                if _is_buffer(param_name):
-                    full_buffer = full_param.detach().to(accelerator.device).contiguous()
+                if _is_persistent_buffer(param_name):
+                    full_buffer = (
+                        full_param.detach().to(device=accelerator.device, dtype=sharded_param.dtype).contiguous()
+                    )
                     dist.broadcast(full_buffer, src=0, group=dist.group.WORLD)
                     sharded_sd[param_name] = full_buffer
                     continue
-                # Not a DTensor (e.g., KT LoRA params on CPU, ignored by FSDP).
-                # Keep on rank 0 only — no broadcast. Other ranks don't need them.
+                # Parameters ignored by FSDP remain rank-local and are managed by their owning integration.
                 sharded_sd[param_name] = full_param.detach()
                 continue
             device_mesh = sharded_param.device_mesh
@@ -563,14 +653,14 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
     else:
         for param_name, sharded_param in meta_sharded_sd.items():
             if not _is_dtensor(sharded_param):
-                if _is_buffer(param_name):
+                if _is_persistent_buffer(param_name):
                     full_buffer = torch.empty(
                         sharded_param.size(), device=accelerator.device, dtype=sharded_param.dtype
                     )
                     dist.broadcast(full_buffer, src=0, group=dist.group.WORLD)
                     sharded_sd[param_name] = full_buffer
                     continue
-                # Not a DTensor (e.g., KT LoRA params) — rank 0 only, skip broadcast.
+                # Parameters ignored by FSDP remain rank-local and are managed by their owning integration.
                 sharded_sd[param_name] = sharded_param
                 continue
             device_mesh = sharded_param.device_mesh
@@ -614,7 +704,7 @@ def fsdp2_switch_optimizer_parameters(optimizer: torch.optim.Optimizer, mapping:
 
     accessor_mapping[DTensor] = "_local_tensor"
 
-    # KT: params not in mapping (e.g., KT LoRA on CPU not sharded by FSDP2) are kept as-is.
+    # Parameters intentionally ignored by FSDP2 have no sharded replacement and remain rank-local.
     for param_group in optimizer.param_groups:
         new_params = []
         for p in param_group["params"]:
@@ -622,7 +712,7 @@ def fsdp2_switch_optimizer_parameters(optimizer: torch.optim.Optimizer, mapping:
             if ptr in mapping:
                 new_params.append(mapping[ptr])
             else:
-                # Keep original param (e.g., KT LoRA params on CPU not sharded by FSDP2)
+                # Keep the original parameter when it is intentionally outside FSDP2 ownership.
                 new_params.append(p)
         param_group["params"] = new_params
 

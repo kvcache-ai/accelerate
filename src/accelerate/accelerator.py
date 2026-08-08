@@ -1449,6 +1449,10 @@ class Accelerator:
 
         </Tip>
 
+        With FSDP2, a model and its optimizer can either be prepared together, or prepared in two stages. Staged
+        preparation must call ``prepare(model)`` first, construct the optimizer from the prepared model parameters,
+        and then call ``prepare(optimizer)``.
+
         Examples:
 
         ```python
@@ -1481,9 +1485,7 @@ class Accelerator:
             )
 
         kt_plugin = getattr(self.state, "kt_config", None)
-        kt_bypass_device_map = bool(
-            kt_plugin is not None and kt_plugin.enabled and kt_plugin.bypass_device_map_check
-        )
+        kt_bypass_device_map = bool(kt_plugin is not None and kt_plugin.enabled and kt_plugin.bypass_device_map_check)
 
         for obj in args:
             # TODO: Look at enabling native TP training directly with a proper config
@@ -1524,22 +1526,9 @@ class Accelerator:
                 )
 
         if self.is_fsdp2:
-            model_count = 0
-            optimizer_count = 0
-            for i, obj in enumerate(args):
-                if isinstance(obj, torch.nn.Module):
-                    model_count += 1
-                elif isinstance(obj, torch.optim.Optimizer):
-                    optimizer_count += 1
-
-            # This needs to be written as such, so that passing other objects other than models/optimizers doesn't raise an error
-            if (model_count < 1 and optimizer_count > 0) or (model_count > 0 and optimizer_count < 1):
-                raise ValueError(
-                    "When using FSDP2, a model and optimizer must be passed together to `Accelerator.prepare()`"
-                    " as the optimizer needs to have its parameters modified after the model is converted."
-                )
-            if model_count > 1:
-                raise ValueError("Only one model is supported when using FSDP2")
+            models = [obj for obj in args if isinstance(obj, torch.nn.Module)]
+            optimizers = [obj for obj in args if isinstance(obj, torch.optim.Optimizer)]
+            self._validate_fsdp2_prepare_inputs(models, optimizers)
 
         # If we're dealing with device placement, this deals with that by...
         tpu_should_fix_optimizer = self.device_placement and self.distributed_type == DistributedType.XLA
@@ -1806,6 +1795,32 @@ class Accelerator:
 
         return result
 
+    def _validate_fsdp2_prepare_inputs(self, models, optimizers):
+        if len(models) > 1:
+            raise ValueError("Only one model is supported when using FSDP2")
+        if len(models) == 1 and not optimizers and self._models:
+            raise ValueError("Only one prepared model is supported when using staged FSDP2 preparation.")
+        if models or not optimizers:
+            return
+        if len(self._models) != 1:
+            raise ValueError(
+                "Staged FSDP2 optimizer preparation requires exactly one model prepared by an earlier "
+                "`Accelerator.prepare(model)` call."
+            )
+
+        prepared_parameter_ids = {id(parameter) for parameter in self._models[0].parameters()}
+        prepared_parameter_count = sum(
+            id(parameter) in prepared_parameter_ids
+            for optimizer in optimizers
+            for parameter_group in optimizer.param_groups
+            for parameter in parameter_group["params"]
+        )
+        if not prepared_parameter_count:
+            raise ValueError(
+                "The staged FSDP2 optimizer does not reference any parameter from the prepared model. Construct "
+                "the optimizer after `Accelerator.prepare(model)`; additional rank-local parameters are allowed."
+            )
+
     def prepare_model(
         self, model: torch.nn.Module, device_placement: bool | None = None, evaluation_mode: bool = False
     ):
@@ -1839,9 +1854,7 @@ class Accelerator:
         self._models.append(model)
 
         kt_plugin = getattr(self.state, "kt_config", None)
-        kt_bypass_device_map = bool(
-            kt_plugin is not None and kt_plugin.enabled and kt_plugin.bypass_device_map_check
-        )
+        kt_bypass_device_map = bool(kt_plugin is not None and kt_plugin.enabled and kt_plugin.bypass_device_map_check)
 
         if kt_plugin is not None and kt_plugin.enabled and kt_plugin.skip_device_placement:
             device_placement = False
@@ -4045,7 +4058,7 @@ class Accelerator:
                         break
         return (model_device, optimizer_device)
 
-    def get_state_dict(self, model, unwrap=True):
+    def get_state_dict(self, model, unwrap=True, adapter_only=False, excluded_parameter_names=()):
         """
         Returns the state dictionary of a model sent through [`Accelerator.prepare`] potentially without full
         precision.
@@ -4055,6 +4068,14 @@ class Accelerator:
                 A PyTorch model sent through [`Accelerator.prepare`]
             unwrap (`bool`, *optional*, defaults to `True`):
                 Whether to return the original underlying state_dict of `model` or to return the wrapped state_dict
+            adapter_only (`bool`, *optional*, defaults to `False`):
+                Return only trainable parameter tensors. For FSDP2 this avoids gathering frozen model parameters and
+                returns the full adapter state dict on rank 0 only. Selective state dicts are not supported for
+                DeepSpeed or FSDP1.
+            excluded_parameter_names (`Iterable[str]`, *optional*, defaults to `()`):
+                Fully qualified parameter names to omit. With FSDP2 adapter-only saves, this also allows integrations
+                to identify frozen placeholders that are intentionally absent from ``model.state_dict()``. Every rank
+                must pass the same names.
 
         Returns:
             `dict`: The state dictionary of the model potentially without full precision.
@@ -4071,6 +4092,17 @@ class Accelerator:
         >>> state_dict = accelerator.get_state_dict(net)
         ```
         """
+
+        if isinstance(excluded_parameter_names, str):
+            raise TypeError("`excluded_parameter_names` must be an iterable of parameter names, not a string.")
+        excluded_parameter_names = tuple(excluded_parameter_names)
+        selective_state_dict = adapter_only or bool(excluded_parameter_names)
+
+        if selective_state_dict and self.distributed_type in (DistributedType.DEEPSPEED, DistributedType.FSDP):
+            if not self.is_fsdp2:
+                raise NotImplementedError(
+                    "Selective state dicts are currently supported for FSDP2, but not DeepSpeed or FSDP1."
+                )
 
         if self.distributed_type == DistributedType.DEEPSPEED:
             zero3_sharding = self.deepspeed_config["zero_optimization"]["stage"] == 3
@@ -4099,10 +4131,13 @@ class Accelerator:
 
                 state_dict = clone_tensors_for_torch_save(self.unwrap_model(model).state_dict())
         elif self.is_fsdp2:
-            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+            from .utils.fsdp_utils import _get_fsdp2_model_state_dict
 
-            options = StateDictOptions(full_state_dict=True, broadcast_from_rank0=True, cpu_offload=True)
-            state_dict = get_model_state_dict(model, options=options)
+            state_dict = _get_fsdp2_model_state_dict(
+                model,
+                adapter_only=adapter_only,
+                excluded_parameter_names=excluded_parameter_names,
+            )
         elif self.distributed_type == DistributedType.FSDP:
             from torch.distributed.fsdp import FullStateDictConfig, StateDictType
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -4114,6 +4149,18 @@ class Accelerator:
             if unwrap:
                 model = self.unwrap_model(model)
             state_dict = model.state_dict()
+
+            if selective_state_dict:
+                named_parameters = dict(model.named_parameters(remove_duplicate=False))
+                missing_names = sorted(set(excluded_parameter_names).difference(named_parameters))
+                if missing_names:
+                    raise ValueError(f"Excluded parameter names were not found in the model: {missing_names}")
+                included_names = {
+                    name
+                    for name, parameter in named_parameters.items()
+                    if (not adapter_only or parameter.requires_grad) and name not in excluded_parameter_names
+                }
+                state_dict = {name: value for name, value in state_dict.items() if name in included_names}
 
         return state_dict
 
