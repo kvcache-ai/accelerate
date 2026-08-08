@@ -56,6 +56,12 @@ class AdapterStateModel(torch.nn.Module):
         return state_dict
 
 
+class GradientClipModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(2))
+
+
 def _fsdp2_accelerator_stub():
     return SimpleNamespace(distributed_type=DistributedType.FSDP, is_fsdp2=True)
 
@@ -166,6 +172,66 @@ def _run_two_rank_state_dict_checks(rank, world_size, rendezvous_path):
                 AdapterStateModel(),
                 AdapterStateModel().state_dict() if rank == 0 else {},
                 rank_local_parameter_names=rank_local_names,
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_two_rank_gradient_clip_checks(rank, world_size, rendezvous_path):
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"file://{rendezvous_path}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        from torch.distributed.fsdp import fully_shard
+
+        model = GradientClipModel()
+        fully_shard(model)
+        model.weight.grad = torch.zeros_like(model.weight)
+        model.weight.grad.to_local().fill_(3.0 if rank == 0 else 0.0)
+
+        external_parameter = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
+        external_parameter.grad = torch.tensor([4.0], dtype=torch.bfloat16)
+        rank_local_parameters = (external_parameter,) if rank == 0 else ()
+        accelerator = SimpleNamespace(
+            device=torch.device("cpu"),
+            distributed_type=DistributedType.FSDP,
+            is_fsdp2=True,
+            _models=[model],
+            unscale_gradients=lambda: None,
+        )
+
+        total_norm = Accelerator.clip_grad_norm_(
+            accelerator,
+            model.parameters(),
+            max_norm=1.0,
+            rank_local_parameters=rank_local_parameters,
+        )
+
+        torch.testing.assert_close(total_norm, torch.tensor(5.0))
+        expected_coefficient = 1.0 / (5.0 + 1e-6)
+        torch.testing.assert_close(
+            model.weight.grad.to_local(),
+            torch.tensor([3.0 * expected_coefficient if rank == 0 else 0.0]),
+        )
+        if rank == 0:
+            torch.testing.assert_close(
+                external_parameter.grad.float(),
+                torch.tensor([4.0 * expected_coefficient]),
+                atol=0.005,
+                rtol=0,
+            )
+
+        invalid_rank_local_parameters = (external_parameter, external_parameter) if rank == 0 else ()
+        with pytest.raises(RuntimeError, match="rank 0: ValueError.*must not contain duplicates"):
+            Accelerator.clip_grad_norm_(
+                accelerator,
+                model.parameters(),
+                max_norm=1.0,
+                rank_local_parameters=invalid_rank_local_parameters,
             )
     finally:
         dist.destroy_process_group()
@@ -502,8 +568,108 @@ def test_fsdp2_optimizer_switch_rejects_model_owned_mapping_miss():
         )
 
 
+def test_rank_local_gradient_clipping_in_non_distributed_training():
+    model_parameter = torch.nn.Parameter(torch.ones(1))
+    model_parameter.grad = torch.tensor([3.0])
+    external_parameter = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
+    external_parameter.grad = torch.tensor([4.0], dtype=torch.bfloat16)
+    accelerator = SimpleNamespace(
+        distributed_type=DistributedType.NO,
+        is_fsdp2=False,
+        unscale_gradients=lambda: None,
+    )
+
+    total_norm = Accelerator.clip_grad_norm_(
+        accelerator,
+        (model_parameter,),
+        max_norm=1.0,
+        rank_local_parameters=(external_parameter,),
+    )
+
+    torch.testing.assert_close(total_norm, torch.tensor(5.0))
+    torch.testing.assert_close(model_parameter.grad, torch.tensor([0.6]))
+    torch.testing.assert_close(external_parameter.grad.float(), torch.tensor([0.8]), atol=0.005, rtol=0)
+
+
+def test_rank_local_gradient_clipping_handles_empty_and_none_gradients():
+    parameter_without_gradient = torch.nn.Parameter(torch.ones(1))
+    accelerator = SimpleNamespace(
+        distributed_type=DistributedType.NO,
+        is_fsdp2=False,
+        unscale_gradients=lambda: None,
+    )
+
+    total_norm = Accelerator.clip_grad_norm_(
+        accelerator,
+        (parameter_without_gradient,),
+        max_norm=1.0,
+        rank_local_parameters=(),
+    )
+
+    torch.testing.assert_close(total_norm, torch.tensor(0.0))
+    assert parameter_without_gradient.grad is None
+
+
+@pytest.mark.parametrize(
+    ("rank_local_parameters", "norm_type", "error_message"),
+    [
+        ("duplicate", 2, "must not contain duplicates"),
+        ("overlap", 2, "must be identity-disjoint"),
+        ("empty", 1, "supports only `norm_type=2`"),
+    ],
+)
+def test_rank_local_gradient_clipping_validates_inputs(rank_local_parameters, norm_type, error_message):
+    parameter = torch.nn.Parameter(torch.ones(1))
+    extras = {
+        "duplicate": (parameter, parameter),
+        "overlap": (parameter,),
+        "empty": (),
+    }[rank_local_parameters]
+    model_parameters = () if rank_local_parameters == "duplicate" else (parameter,)
+    accelerator = SimpleNamespace(
+        distributed_type=DistributedType.NO,
+        is_fsdp2=False,
+        unscale_gradients=lambda: None,
+    )
+
+    with pytest.raises(ValueError, match=error_message):
+        Accelerator.clip_grad_norm_(
+            accelerator,
+            model_parameters,
+            max_norm=1.0,
+            norm_type=norm_type,
+            rank_local_parameters=extras,
+        )
+
+
+def test_fsdp2_gradient_clip_collective_device_follows_backend():
+    with patch("torch.distributed.get_backend", return_value="gloo"):
+        assert Accelerator._fsdp2_grad_clip_collective_device(torch.device("cuda:1")) == torch.device("cpu")
+    with patch("torch.distributed.get_backend", return_value="nccl"):
+        assert Accelerator._fsdp2_grad_clip_collective_device(torch.device("cuda:1")) == torch.device("cuda:1")
+
+
+def test_rank_local_gradient_clipping_rejects_non_fsdp2_distributed_training():
+    accelerator = SimpleNamespace(distributed_type=DistributedType.MULTI_CPU, is_fsdp2=False)
+
+    with pytest.raises(RuntimeError, match="only in non-distributed training or with FSDP2"):
+        Accelerator.clip_grad_norm_(
+            accelerator,
+            (),
+            max_norm=1.0,
+            rank_local_parameters=(),
+        )
+
+
 @pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires torch.distributed gloo")
 def test_fsdp2_state_dict_contract_is_symmetric_across_two_ranks():
     with tempfile.TemporaryDirectory() as temporary_directory:
         rendezvous_path = f"{temporary_directory}/rendezvous"
         mp.spawn(_run_two_rank_state_dict_checks, args=(2, rendezvous_path), nprocs=2, join=True)
+
+
+@pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires torch.distributed gloo")
+def test_fsdp2_combined_gradient_clipping_is_symmetric_across_two_ranks():
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        rendezvous_path = f"{temporary_directory}/rendezvous"
+        mp.spawn(_run_two_rank_gradient_clip_checks, args=(2, rendezvous_path), nprocs=2, join=True)

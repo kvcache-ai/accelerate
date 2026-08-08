@@ -3092,9 +3092,165 @@ class Accelerator:
                     opt = opt.optimizer
                 self.scaler.unscale_(opt)
 
-    def clip_grad_norm_(self, parameters, max_norm, norm_type=2):
+    @staticmethod
+    def _fsdp2_grad_clip_collective_device(device: torch.device) -> torch.device:
+        backend = str(torch.distributed.get_backend()).lower()
+        return torch.device("cpu") if backend == "gloo" else torch.device(device)
+
+    def _clip_grad_norm_with_rank_local_parameters(self, parameters, rank_local_parameters, max_norm, norm_type):
+        if self.distributed_type != DistributedType.FSDP or not self.is_fsdp2:
+            distributed_world_size = (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 1
+            )
+            if self.distributed_type != DistributedType.NO or distributed_world_size != 1:
+                raise RuntimeError(
+                    "`rank_local_parameters` gradient clipping is supported only in non-distributed training or "
+                    "with FSDP2."
+                )
+
+            model_parameters = [parameters] if isinstance(parameters, torch.Tensor) else list(parameters)
+            rank_local_parameters = (
+                [rank_local_parameters]
+                if isinstance(rank_local_parameters, torch.Tensor)
+                else list(rank_local_parameters)
+            )
+            if any(not isinstance(parameter, torch.Tensor) for parameter in rank_local_parameters):
+                raise TypeError("`rank_local_parameters` must contain only tensors.")
+            rank_local_parameter_ids = [id(parameter) for parameter in rank_local_parameters]
+            if len(rank_local_parameter_ids) != len(set(rank_local_parameter_ids)):
+                raise ValueError("`rank_local_parameters` must not contain duplicates.")
+            if set(rank_local_parameter_ids).intersection(id(parameter) for parameter in model_parameters):
+                raise ValueError("`rank_local_parameters` must be identity-disjoint from `parameters`.")
+            if float(norm_type) != 2.0:
+                raise ValueError("`rank_local_parameters` gradient clipping supports only `norm_type=2`.")
+
+            self.unscale_gradients()
+            return torch.nn.utils.clip_grad_norm_([*model_parameters, *rank_local_parameters], max_norm, norm_type=2.0)
+
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            raise RuntimeError("FSDP2 combined gradient clipping requires an initialized process group.")
+
+        collective_device = Accelerator._fsdp2_grad_clip_collective_device(self.device)
+        rank_local_parameters_input = rank_local_parameters
+        model_parameters = ()
+        rank_local_parameters = ()
+        local_error = None
+        try:
+            if float(norm_type) != 2.0:
+                raise ValueError("FSDP2 combined gradient clipping supports only `norm_type=2`.")
+            max_norm = float(max_norm)
+            if math.isnan(max_norm) or max_norm < 0:
+                raise ValueError("`max_norm` must be a non-negative number.")
+
+            model_parameters = (parameters,) if isinstance(parameters, torch.Tensor) else tuple(parameters)
+            rank_local_parameters = (
+                (rank_local_parameters_input,)
+                if isinstance(rank_local_parameters_input, torch.Tensor)
+                else tuple(rank_local_parameters_input)
+            )
+            if any(not isinstance(parameter, torch.Tensor) for parameter in model_parameters):
+                raise TypeError("`parameters` must contain only tensors.")
+            if any(not isinstance(parameter, torch.Tensor) for parameter in rank_local_parameters):
+                raise TypeError("`rank_local_parameters` must contain only tensors.")
+
+            model_parameter_ids = [id(parameter) for parameter in model_parameters]
+            rank_local_parameter_ids = [id(parameter) for parameter in rank_local_parameters]
+            if len(rank_local_parameter_ids) != len(set(rank_local_parameter_ids)):
+                raise ValueError("`rank_local_parameters` must not contain duplicates.")
+            if set(model_parameter_ids).intersection(rank_local_parameter_ids):
+                raise ValueError("`rank_local_parameters` must be identity-disjoint from `parameters`.")
+
+            matching_models = []
+            for model in self._models:
+                candidate_parameters = tuple(model.parameters())
+                if len(candidate_parameters) == len(model_parameter_ids) and all(
+                    id(parameter) == parameter_id
+                    for parameter, parameter_id in zip(candidate_parameters, model_parameter_ids)
+                ):
+                    matching_models.append(model)
+            if len(matching_models) != 1:
+                raise ValueError("`parameters` must be the complete parameter iterable of one prepared FSDP2 model.")
+
+            from torch.distributed.tensor import DTensor
+
+            if any(isinstance(parameter, DTensor) for parameter in rank_local_parameters):
+                raise TypeError("`rank_local_parameters` must be ordinary rank-local tensors, not DTensors.")
+        except Exception as error:
+            local_error = error
+
+        try:
+            self.unscale_gradients()
+        except Exception as error:
+            if local_error is None:
+                local_error = error
+
+        preflight_and_norm = torch.zeros(2, dtype=torch.float32, device=collective_device)
+        if local_error is None:
+            try:
+                from torch.distributed.tensor import DTensor
+
+                for parameter in rank_local_parameters:
+                    gradient = parameter.grad
+                    if gradient is None:
+                        continue
+                    if isinstance(gradient, DTensor):
+                        raise TypeError("Rank-local gradients must be ordinary tensors, not DTensors.")
+                    gradient_values = gradient.coalesce().values() if gradient.is_sparse else gradient
+                    preflight_and_norm[1].add_(gradient_values.detach().float().square().sum().to(collective_device))
+            except Exception as error:
+                local_error = error
+        if local_error is not None:
+            preflight_and_norm[0] = 1
+
+        torch.distributed.all_reduce(preflight_and_norm, op=torch.distributed.ReduceOp.SUM)
+        if preflight_and_norm[0].item() != 0:
+            local_error_message = None if local_error is None else f"{type(local_error).__name__}: {local_error}"
+            error_messages = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(error_messages, local_error_message)
+            errors = [f"rank {rank}: {message}" for rank, message in enumerate(error_messages) if message is not None]
+            raise RuntimeError(f"FSDP2 combined gradient-clipping preflight failed: {'; '.join(errors)}")
+
+        get_total_norm = getattr(torch.nn.utils, "get_total_norm", None)
+        if get_total_norm is None:
+            # PyTorch 2.6 has the helper used by `clip_grad_norm_`, but does not export its public alias.
+            from torch.nn.utils.clip_grad import _get_total_norm as get_total_norm
+
+        model_norm = get_total_norm(
+            [parameter.grad for parameter in model_parameters if parameter.grad is not None], norm_type=2.0
+        )
+        placements = getattr(model_norm, "placements", ())
+        if placements and not all(placement.is_replicate() for placement in placements):
+            raise RuntimeError("FSDP2 model gradient norm must be replicated before it can be combined.")
+        if hasattr(model_norm, "to_local"):
+            model_norm = model_norm.to_local()
+        model_norm = model_norm.detach().to(device=collective_device, dtype=torch.float32)
+        combined_norm = torch.sqrt(model_norm.square() + preflight_and_norm[1])
+        clip_grads_with_norm = getattr(torch.nn.utils, "clip_grads_with_norm_", None)
+        if clip_grads_with_norm is None:
+            from torch.nn.utils.clip_grad import _clip_grads_with_norm_ as clip_grads_with_norm
+
+        clip_grads_with_norm(model_parameters, max_norm, combined_norm)
+        clip_grads_with_norm(rank_local_parameters, max_norm, combined_norm)
+        return combined_norm
+
+    def clip_grad_norm_(self, parameters, max_norm, norm_type=2, *, rank_local_parameters=None):
         """
         Should be used in place of `torch.nn.utils.clip_grad_norm_`.
+
+        Args:
+            parameters (`Iterable[torch.Tensor]`):
+                Parameters whose gradients should be clipped.
+            max_norm (`float`):
+                Maximum norm of the gradients.
+            norm_type (`float`, *optional*, defaults to 2):
+                Type of the used p-norm.
+            rank_local_parameters (`Iterable[torch.Tensor]`, *optional*):
+                Additional optimizer parameters that are not part of the prepared model and may exist on only some
+                ranks. With FSDP2, pass this argument explicitly on every rank (an empty iterable on non-owner ranks)
+                to include their gradients in one global L2 norm and clipping coefficient. The tensors must be
+                identity-disjoint from `parameters`. Only `norm_type=2` is supported with this argument.
 
         Returns:
             `torch.Tensor`: Total norm of the parameter gradients (viewed as a single vector).
@@ -3117,6 +3273,10 @@ class Accelerator:
         ...     optimizer.step()
         ```
         """
+        if rank_local_parameters is not None:
+            return Accelerator._clip_grad_norm_with_rank_local_parameters(
+                self, parameters, rank_local_parameters, max_norm, norm_type
+            )
         if self.distributed_type == DistributedType.FSDP:
             self.unscale_gradients()
             parameters = [p for p in parameters]
