@@ -211,11 +211,12 @@ def _run_two_rank_gradient_clip_checks(rank, world_size, rendezvous_path):
             rank_local_parameters=rank_local_parameters,
         )
 
-        torch.testing.assert_close(total_norm, torch.tensor(5.0))
+        torch.testing.assert_close(total_norm, total_norm.new_tensor(5.0))
         expected_coefficient = 1.0 / (5.0 + 1e-6)
+        model_local_grad = model.weight.grad.to_local()
         torch.testing.assert_close(
-            model.weight.grad.to_local(),
-            torch.tensor([3.0 * expected_coefficient if rank == 0 else 0.0]),
+            model_local_grad,
+            model_local_grad.new_tensor([3.0 * expected_coefficient if rank == 0 else 0.0]),
         )
         if rank == 0:
             torch.testing.assert_close(
@@ -282,11 +283,18 @@ def _run_two_rank_adapter_checkpoint_checks(rank, world_size, rendezvous_path, o
             dist.barrier()
 
             checkpoint_path = os.path.join(output_dir, "pytorch_model_fsdp.bin")
+            checkpoint_error = None
             if rank == 0:
-                saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-                assert set(saved) == {"adapter"}
-                torch.testing.assert_close(saved["adapter"], expected_adapter)
-                assert os.path.getsize(checkpoint_path) < 64 * 1024
+                try:
+                    saved = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+                    assert set(saved) == {"adapter"}
+                    torch.testing.assert_close(saved["adapter"], expected_adapter.cpu())
+                    assert os.path.getsize(checkpoint_path) < 64 * 1024
+                except Exception as error:
+                    checkpoint_error = f"{type(error).__name__}: {error}"
+            checkpoint_errors = [None] * world_size
+            dist.all_gather_object(checkpoint_errors, checkpoint_error)
+            assert not any(checkpoint_errors), checkpoint_errors
 
             with torch.no_grad():
                 model.adapter.to_local().fill_(-7)
