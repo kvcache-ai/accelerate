@@ -96,11 +96,11 @@ def _set_model_state_dict(model, state_dict, adapter_only=False, sd_options=None
             model, adapter_only=True, excluded_parameter_names=excluded_parameter_names
         )
         _validate_fsdp2_adapter_state_dict(state_dict, adapter_names, adapter_options)
-        original_requires_grad = _enable_fsdp2_excluded_parameters(named_parameters, excluded_names)
+        original_data = _scalarize_fsdp2_excluded_parameters(named_parameters, excluded_names)
         try:
             return set_model_state_dict(model, state_dict, options=adapter_options)
         finally:
-            _restore_fsdp2_excluded_parameters(named_parameters, original_requires_grad)
+            _restore_fsdp2_excluded_parameter_data(named_parameters, original_data)
 
     if adapter_only and is_peft_model(model):
         from peft import set_peft_model_state_dict
@@ -234,6 +234,34 @@ def _restore_fsdp2_excluded_parameters(named_parameters, original_requires_grad)
         identity = id(parameter)
         if identity in original_requires_grad and identity not in restored_parameters:
             parameter.requires_grad_(original_requires_grad[identity])
+            restored_parameters.add(identity)
+
+
+def _scalarize_fsdp2_excluded_parameters(named_parameters, excluded_parameter_names):
+    excluded_parameters = {
+        id(named_parameters[name]): named_parameters[name] for name in set(excluded_parameter_names)
+    }
+    original_data = {identity: parameter.data for identity, parameter in excluded_parameters.items()}
+    local_error = None
+    try:
+        for parameter in excluded_parameters.values():
+            parameter.data = parameter.data.new_empty(())
+    except Exception as error:
+        local_error = f"{type(error).__name__}: {error}"
+
+    errors = _synchronize_state_dict_preflight(local_error)
+    if errors:
+        _restore_fsdp2_excluded_parameter_data(named_parameters, original_data)
+        raise RuntimeError(f"FSDP2 state-dict preflight failed while preparing exclusions: {'; '.join(errors)}")
+    return original_data
+
+
+def _restore_fsdp2_excluded_parameter_data(named_parameters, original_data):
+    restored_parameters = set()
+    for parameter in named_parameters.values():
+        identity = id(parameter)
+        if identity in original_data and identity not in restored_parameters:
+            parameter.data = original_data[identity]
             restored_parameters.add(identity)
 
 

@@ -46,7 +46,8 @@ class AdapterStateModel(torch.nn.Module):
         super().__init__()
         self.frozen = torch.nn.Parameter(torch.tensor([1.0, 2.0]), requires_grad=False)
         self.adapter = torch.nn.Parameter(torch.tensor([3.0, 4.0]))
-        self.placeholder = torch.nn.Parameter(torch.tensor([5.0, 6.0]), requires_grad=False)
+        placeholder = torch.tensor([5.0]).as_strided((2,), (0,)) if omit_placeholder else torch.tensor([5.0, 6.0])
+        self.placeholder = torch.nn.Parameter(placeholder, requires_grad=False)
         self.omit_placeholder = omit_placeholder
 
     def state_dict(self, *args, **kwargs):
@@ -305,12 +306,23 @@ def _run_two_rank_adapter_checkpoint_checks(rank, world_size, rendezvous_path, o
                 if omit_placeholder
                 else model.placeholder.full_tensor().detach().clone()
             )
+            expected_placeholder_layout = (
+                model.placeholder.shape,
+                model.placeholder.stride(),
+                model.placeholder.untyped_storage().nbytes(),
+            )
 
             load_fsdp_model(plugin, accelerator, model, output_dir, **checkpoint_kwargs)
             torch.testing.assert_close(model.adapter.full_tensor(), expected_adapter)
             torch.testing.assert_close(model.frozen.full_tensor(), expected_mutated_base)
             restored_placeholder = model.placeholder if omit_placeholder else model.placeholder.full_tensor()
             torch.testing.assert_close(restored_placeholder, expected_placeholder)
+            if omit_placeholder:
+                assert (
+                    restored_placeholder.shape,
+                    restored_placeholder.stride(),
+                    restored_placeholder.untyped_storage().nbytes(),
+                ) == expected_placeholder_layout
             assert not model.placeholder.requires_grad
 
             dist.barrier()
