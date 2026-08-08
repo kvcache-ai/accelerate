@@ -556,7 +556,13 @@ def ensure_weights_retied(param_init_fn, model: torch.nn.Module, device: torch.d
     return param_init_fn_tied_param
 
 
-def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dict, cpu_offload: bool = False):
+def fsdp2_load_full_state_dict(
+    accelerator,
+    model: torch.nn.Module,
+    full_sd: dict,
+    cpu_offload: bool = False,
+    rank_local_parameter_names: Iterable[str] = (),
+):
     """
     Loads the full state dict (could be only on rank 0) into the sharded model. This is done by broadcasting the
     parameters from rank 0 to all other ranks. This function modifies the model in-place.
@@ -568,6 +574,9 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
         full_sd (`dict`): The full state dict to load, can only be on rank 0
         cpu_offload (`bool`, defaults to `False`):
             If True, move sharded parameters to CPU after distribution. Required when FSDP CPU offloading is enabled.
+        rank_local_parameter_names (`Iterable[str]`, defaults to `()`):
+            Fully qualified parameter names owned by an external integration. These parameters are not broadcast or
+            materialized by this function.
     """
     import torch.distributed as dist
     from torch.distributed.tensor import DTensor, distribute_tensor
@@ -575,16 +584,56 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
     # Model was previously copied to meta device
     meta_sharded_sd = model.state_dict()
     sharded_sd = {}
+    local_error = None
+    try:
+        if isinstance(rank_local_parameter_names, str):
+            raise TypeError("`rank_local_parameter_names` must be an iterable of parameter names, not a string.")
+        rank_local_parameter_names = tuple(rank_local_parameter_names)
+        if any(not isinstance(name, str) or not name for name in rank_local_parameter_names):
+            raise TypeError("`rank_local_parameter_names` must contain only non-empty strings.")
+        if len(rank_local_parameter_names) != len(set(rank_local_parameter_names)):
+            raise ValueError("`rank_local_parameter_names` must not contain duplicates.")
+        named_parameters = fsdp2_canonicalize_names(dict(model.named_parameters()))
+        missing_rank_local_names = sorted(set(rank_local_parameter_names).difference(named_parameters))
+        del named_parameters
+        if missing_rank_local_names:
+            raise ValueError(f"Rank-local parameter names were not found in the model: {missing_rank_local_names}")
+    except Exception as error:
+        local_error = error
+        rank_local_parameter_names = ()
+
+    if dist.is_available() and dist.is_initialized():
+        local_error_message = None if local_error is None else f"{type(local_error).__name__}: {local_error}"
+        payloads = [None] * dist.get_world_size()
+        dist.all_gather_object(payloads, (rank_local_parameter_names, local_error_message))
+        errors = [f"rank {rank}: {payload[1]}" for rank, payload in enumerate(payloads) if payload[1] is not None]
+        if errors:
+            raise RuntimeError(f"FSDP2 full-state rank-local preflight failed: {'; '.join(errors)}")
+        if any(payload[0] != payloads[0][0] for payload in payloads[1:]):
+            raise RuntimeError("FSDP2 full-state rank-local parameter names must be identical on every rank.")
+    elif local_error is not None:
+        raise local_error
+    rank_local_parameter_names = set(rank_local_parameter_names)
+
+    def _canonicalize_name(name):
+        return next(iter(fsdp2_canonicalize_names({name: None})))
 
     # Rank 0 distributes the full state dict to other ranks
     def _infer_parameter_dtype(model, param_name, empty_param):
         try:
-            old_param = model.get_parameter_or_buffer(param_name)
+            old_param = model.get_parameter(param_name)
         except AttributeError:
-            # Need this for LORA, as there some params are not *parameters* of sorts
-            base_param_name, local_param_name = param_name.rsplit(".", 1)
-            submodule = model.get_submodule(base_param_name)
-            old_param = getattr(submodule, local_param_name)
+            try:
+                old_param = model.get_buffer(param_name)
+            except AttributeError:
+                # Need this for LoRA, as some state-dict values are plain tensor attributes.
+                if "." in param_name:
+                    base_param_name, local_param_name = param_name.rsplit(".", 1)
+                    submodule = model.get_submodule(base_param_name)
+                else:
+                    local_param_name = param_name
+                    submodule = model
+                old_param = getattr(submodule, local_param_name)
 
         is_torch_e4m3fn_available = hasattr(torch, "float8_e4m3fn")
         casting_dtype = None
@@ -606,13 +655,6 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
         """Check whether a state-dict value is managed by FSDP2."""
         return hasattr(param, "device_mesh") and param.device_mesh is not None
 
-    def _is_persistent_buffer(param_name):
-        try:
-            model.get_buffer(param_name)
-        except AttributeError:
-            return False
-        return True
-
     if accelerator.is_main_process:
         for param_name, sharded_param in meta_sharded_sd.items():
             if param_name not in full_sd:
@@ -622,15 +664,12 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
                 )
             full_param = full_sd[param_name]
             if not _is_dtensor(sharded_param):
-                if _is_persistent_buffer(param_name):
-                    full_buffer = (
-                        full_param.detach().to(device=accelerator.device, dtype=sharded_param.dtype).contiguous()
-                    )
-                    dist.broadcast(full_buffer, src=0, group=dist.group.WORLD)
-                    sharded_sd[param_name] = full_buffer
+                if _canonicalize_name(param_name) in rank_local_parameter_names:
+                    sharded_sd[param_name] = full_param.detach()
                     continue
-                # Parameters ignored by FSDP remain rank-local and are managed by their owning integration.
-                sharded_sd[param_name] = full_param.detach()
+                full_tensor = full_param.detach().to(device=accelerator.device, dtype=sharded_param.dtype).contiguous()
+                dist.broadcast(full_tensor, src=0, group=dist.group.WORLD)
+                sharded_sd[param_name] = full_tensor
                 continue
             device_mesh = sharded_param.device_mesh
             full_param = full_param.detach().to(device_mesh.device_type)
@@ -655,15 +694,12 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
     else:
         for param_name, sharded_param in meta_sharded_sd.items():
             if not _is_dtensor(sharded_param):
-                if _is_persistent_buffer(param_name):
-                    full_buffer = torch.empty(
-                        sharded_param.size(), device=accelerator.device, dtype=sharded_param.dtype
-                    )
-                    dist.broadcast(full_buffer, src=0, group=dist.group.WORLD)
-                    sharded_sd[param_name] = full_buffer
+                if _canonicalize_name(param_name) in rank_local_parameter_names:
+                    sharded_sd[param_name] = sharded_param
                     continue
-                # Parameters ignored by FSDP remain rank-local and are managed by their owning integration.
-                sharded_sd[param_name] = sharded_param
+                full_tensor = torch.empty(sharded_param.size(), device=accelerator.device, dtype=sharded_param.dtype)
+                dist.broadcast(full_tensor, src=0, group=dist.group.WORLD)
+                sharded_sd[param_name] = full_tensor
                 continue
             device_mesh = sharded_param.device_mesh
             full_tensor = torch.empty(sharded_param.size(), device=device_mesh.device_type, dtype=sharded_param.dtype)
@@ -685,7 +721,9 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
     return model
 
 
-def fsdp2_switch_optimizer_parameters(optimizer: torch.optim.Optimizer, mapping: dict):
+def fsdp2_switch_optimizer_parameters(
+    optimizer: torch.optim.Optimizer, mapping: dict, model_owned_parameter_ids: Iterable[int] = ()
+):
     """
     Switches the parameters of the optimizer to new ones (sharded parameters in usual case). This function modifies the
     optimizer in-place.
@@ -693,6 +731,8 @@ def fsdp2_switch_optimizer_parameters(optimizer: torch.optim.Optimizer, mapping:
     Args:
         optimizer (`torch.optim.Optimizer`): Optimizer instance which contains the original model parameters
         mapping (`dict`): Mapping from the original parameter (specified by `data_ptr`) to the sharded parameter
+        model_owned_parameter_ids (`Iterable[int]`, defaults to `()`): Identities of temporary model-parameter
+            placeholders that must have an entry in ``mapping``. Other parameters are kept unchanged.
 
     Raises:
         KeyError:
@@ -700,21 +740,16 @@ def fsdp2_switch_optimizer_parameters(optimizer: torch.optim.Optimizer, mapping:
             indicates a bug. If we kept the original params instead of raising, the training wouldn't be numerically
             correct and weights wouldn't get updated.
     """
-    from torch.distributed.tensor import DTensor
-
-    accessor_mapping = {}
-
-    accessor_mapping[DTensor] = "_local_tensor"
-
-    # Parameters intentionally ignored by FSDP2 have no sharded replacement and remain rank-local.
+    model_owned_parameter_ids = set(model_owned_parameter_ids)
     for param_group in optimizer.param_groups:
         new_params = []
         for p in param_group["params"]:
             ptr = p.data_ptr if not callable(getattr(p, "data_ptr", None)) else p.data_ptr()
             if ptr in mapping:
                 new_params.append(mapping[ptr])
+            elif id(p) in model_owned_parameter_ids:
+                raise KeyError("A model-owned optimizer parameter could not be mapped after FSDP2 preparation.")
             else:
-                # Keep the original parameter when it is intentionally outside FSDP2 ownership.
                 new_params.append(p)
         param_group["params"] = new_params
 
@@ -752,12 +787,18 @@ def fsdp2_apply_ac(accelerator, model: torch.nn.Module):
     return model
 
 
-def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
+def fsdp2_prepare_model(
+    accelerator,
+    model: torch.nn.Module,
+    rank_local_parameter_names: Iterable[str] = (),
+) -> torch.nn.Module:
     """Prepares the model for FSDP2 in-place. Also returns the model to avoid misuse of the original model.
 
     Args:
         accelerator (`Accelerator`): The accelerator instance
         model (`torch.nn.Module`): The model to prepare
+        rank_local_parameter_names (`Iterable[str]`, defaults to `()`): Fully qualified names of explicitly registered
+            parameters owned outside FSDP2.
 
     Returns:
         `torch.nn.Module`: Prepared model
@@ -771,6 +812,18 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         return model
 
     fsdp2_plugin = accelerator.state.fsdp_plugin
+    if isinstance(rank_local_parameter_names, str):
+        raise TypeError("`rank_local_parameter_names` must be an iterable of parameter names, not a string.")
+    rank_local_parameter_names = tuple(rank_local_parameter_names)
+    if any(not isinstance(name, str) or not name for name in rank_local_parameter_names):
+        raise TypeError("`rank_local_parameter_names` must contain only non-empty strings.")
+    if len(rank_local_parameter_names) != len(set(rank_local_parameter_names)):
+        raise ValueError("`rank_local_parameter_names` must not contain duplicates.")
+    named_parameters = fsdp2_canonicalize_names(dict(model.named_parameters()))
+    missing_rank_local_names = sorted(set(rank_local_parameter_names).difference(named_parameters))
+    del named_parameters
+    if missing_rank_local_names:
+        raise RuntimeError(f"Registered FSDP2 rank-local parameters are missing: {missing_rank_local_names}")
 
     fsdp2_plugin.set_auto_wrap_policy(model)
 
@@ -786,11 +839,6 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
     }
 
     # `ignored_params` is only supported in torch >= 2.7.0
-    if is_torch_version(">=", "2.7.0") and fsdp2_plugin.ignored_modules is not None:
-        fsdp2_kwargs["ignored_params"] = get_parameters_from_modules(
-            fsdp2_plugin.ignored_modules, model, accelerator.device
-        )
-
     model_has_params4bit = False
     incompatible_params4bit = set()
     for name, param in model.named_parameters():
@@ -835,6 +883,20 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         if hasattr(model, "tie_weights"):
             model.tie_weights()
 
+    if is_torch_version(">=", "2.7.0") and fsdp2_plugin.ignored_modules is not None:
+        ignored = set(fsdp2_kwargs.get("ignored_params", set()))
+        fsdp2_kwargs["ignored_params"] = ignored | get_parameters_from_modules(
+            fsdp2_plugin.ignored_modules, model, accelerator.device
+        )
+    if rank_local_parameter_names:
+        if is_torch_version("<", "2.7.0"):
+            raise RuntimeError("FSDP2 rank-local parameters require PyTorch 2.7 or newer.")
+        current_named_parameters = fsdp2_canonicalize_names(dict(model.named_parameters()))
+        current_rank_local_parameters = {name: current_named_parameters[name] for name in rank_local_parameter_names}
+        del current_named_parameters
+        ignored = set(fsdp2_kwargs.get("ignored_params", set()))
+        fsdp2_kwargs["ignored_params"] = ignored | set(current_rank_local_parameters.values())
+
     auto_wrap_policy_func = fsdp2_prepare_auto_wrap_policy(fsdp2_plugin, model)
     if auto_wrap_policy_func is not None:
         # We skip the model itself, as that one is always wrapped
@@ -852,7 +914,11 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         from torch.distributed.fsdp import CPUOffloadPolicy
 
         fsdp2_load_full_state_dict(
-            accelerator, model, original_sd, cpu_offload=isinstance(fsdp2_plugin.cpu_offload, CPUOffloadPolicy)
+            accelerator,
+            model,
+            original_sd,
+            cpu_offload=isinstance(fsdp2_plugin.cpu_offload, CPUOffloadPolicy),
+            rank_local_parameter_names=rank_local_parameter_names,
         )
 
     if fsdp2_plugin.cpu_ram_efficient_loading and not model_has_params4bit:

@@ -23,7 +23,9 @@ import os
 import re
 import shutil
 import warnings
+import weakref
 from collections import OrderedDict
+from collections.abc import Iterable
 from contextlib import contextmanager
 from functools import partial
 from types import MethodType
@@ -634,6 +636,9 @@ class Accelerator:
         self._schedulers = []
         self._dataloaders = []
         self._custom_objects = []
+        self._fsdp2_rank_local_parameters = weakref.WeakKeyDictionary()
+        self._fsdp2_source_parameter_ids = frozenset()
+        self._fsdp2_current_parameter_ids = frozenset()
 
         # Hooks
         self._load_model_state_pre_hook = OrderedDict()
@@ -1698,29 +1703,7 @@ class Accelerator:
         if model_index is None:
             return tuple(result)
 
-        # Register KT expert modules as ignored_modules for FSDP2.
-        # Only ignore the experts submodule (CPU-side, managed by KT kernel).
-        # The router (gate) and shared_experts remain FSDP2-managed.
-        kt_plugin = getattr(self.state, "kt_config", None)
-        if kt_plugin is not None and kt_plugin.enabled:
-            kt_wrappers = getattr(model, "_kt_wrappers", None)
-            if kt_wrappers is None:
-                _base = model
-                for _attr in ("base_model", "model"):
-                    _base = getattr(_base, _attr, None)
-                    if _base is None:
-                        break
-                    kt_wrappers = getattr(_base, "_kt_wrappers", None)
-                    if kt_wrappers is not None:
-                        break
-            if kt_wrappers is not None:
-                if self.state.fsdp_plugin.ignored_modules is None:
-                    self.state.fsdp_plugin.ignored_modules = []
-                for wrapper in kt_wrappers:
-                    experts_attr = getattr(wrapper, "_experts_attr", "experts")
-                    experts = getattr(wrapper, experts_attr, None)
-                    if experts is not None and experts not in self.state.fsdp_plugin.ignored_modules:
-                        self.state.fsdp_plugin.ignored_modules.append(experts)
+        rank_local_parameter_names = self._get_fsdp2_rank_local_parameters(model)
 
         # Needs to be done first, to make sure AC + fully_shard will work as expected
         self.state.fsdp_plugin.set_auto_wrap_policy(model)
@@ -1737,27 +1720,39 @@ class Accelerator:
             else:
                 model = torch.compile(model, **self.state.dynamo_plugin.to_kwargs())
 
+        source_model_parameter_ids = {id(parameter) for parameter in model.parameters()}
+
         # Get old params and canonicalize - we canonicalize to have the mapping easy
         old_named_params = fsdp2_canonicalize_names(self._get_named_parameters(*tuple(result), drop_refs=True))
 
         # Swap the optimizer parameters with empty, so `fully_shard` after will not allocate too much memory
         from torch.distributed.tensor import DTensor
 
+        model_owned_placeholders = {}
         for obj in result:
             if isinstance(obj, torch.optim.Optimizer):
+                placeholders = set()
                 for param_group in obj.param_groups:
                     for i, p in enumerate(param_group["params"]):
+                        if id(p) not in source_model_parameter_ids:
+                            continue
                         # We drop a reference to the original param here, so that _move_states_to_device triggers a reallocation
                         # We reassign the data_ptr to the original param, so that we preserve the mapping to the new ones
                         param_group["params"][i] = torch.empty(1, dtype=p.dtype, device=p.device)
                         param_group["params"][i].data_ptr = (
                             p._local_tensor.data_ptr() if isinstance(p, DTensor) else p.data_ptr()
                         )
+                        placeholders.add(id(param_group["params"][i]))
+                model_owned_placeholders[id(obj)] = placeholders
 
         self._models.append(model)
 
         # Prepare everything FSDP2 related for the model (except AC)
-        model = fsdp2_prepare_model(self, model)
+        model = fsdp2_prepare_model(
+            self,
+            model,
+            rank_local_parameter_names=rank_local_parameter_names,
+        )
 
         # Remove the old model from the list
         if len(self._models) > 1 and (self._models[-2] is self._models[-1]):
@@ -1765,6 +1760,8 @@ class Accelerator:
 
         # Replace the old model with the new one (shouldn't be needed as everything should be in place)
         result[model_index] = model
+        self._fsdp2_source_parameter_ids = frozenset(source_model_parameter_ids)
+        self._fsdp2_current_parameter_ids = frozenset(id(parameter) for parameter in model.parameters())
 
         # Get new params and canonicalize
         new_named_params = fsdp2_canonicalize_names(self._get_named_parameters(*result))
@@ -1791,7 +1788,11 @@ class Accelerator:
         # Update the optimizer parameters
         for obj in result:
             if isinstance(obj, torch.optim.Optimizer):
-                fsdp2_switch_optimizer_parameters(obj, mapping)
+                fsdp2_switch_optimizer_parameters(
+                    obj,
+                    mapping,
+                    model_owned_parameter_ids=model_owned_placeholders.get(id(obj), ()),
+                )
 
         return result
 
@@ -1809,17 +1810,97 @@ class Accelerator:
             )
 
         prepared_parameter_ids = {id(parameter) for parameter in self._models[0].parameters()}
-        prepared_parameter_count = sum(
-            id(parameter) in prepared_parameter_ids
-            for optimizer in optimizers
-            for parameter_group in optimizer.param_groups
-            for parameter in parameter_group["params"]
+        prepared_boundary_parameter_ids = set(getattr(self, "_fsdp2_current_parameter_ids", prepared_parameter_ids))
+        stale_parameter_ids = set(getattr(self, "_fsdp2_source_parameter_ids", ())).difference(
+            prepared_boundary_parameter_ids
         )
-        if not prepared_parameter_count:
-            raise ValueError(
-                "The staged FSDP2 optimizer does not reference any parameter from the prepared model. Construct "
-                "the optimizer after `Accelerator.prepare(model)`; additional rank-local parameters are allowed."
+        for optimizer_index, optimizer in enumerate(optimizers):
+            optimizer_parameter_ids = {
+                id(parameter) for parameter_group in optimizer.param_groups for parameter in parameter_group["params"]
+            }
+            if optimizer_parameter_ids.intersection(stale_parameter_ids):
+                raise ValueError(
+                    f"Staged FSDP2 optimizer {optimizer_index} references parameters from the model before it was "
+                    "prepared. Construct the optimizer after `Accelerator.prepare(model)`."
+                )
+            if optimizer_parameter_ids.isdisjoint(prepared_parameter_ids):
+                raise ValueError(
+                    f"Staged FSDP2 optimizer {optimizer_index} does not reference any parameter from the prepared "
+                    "model. Construct the optimizer after `Accelerator.prepare(model)`; additional rank-local "
+                    "parameters are allowed."
+                )
+
+    def register_fsdp2_rank_local_parameters(self, model: torch.nn.Module, parameter_names: Iterable[str]) -> None:
+        """Register model parameters that an external integration owns outside FSDP2.
+
+        The names must be fully qualified names from ``model.named_parameters()``. Registered parameters are ignored
+        by FSDP2 and are not materialized or broadcast by FSDP2's full-state loader.
+        """
+        local_error = None
+        named_parameters = {}
+        try:
+            if not self.is_fsdp2:
+                raise ValueError("Rank-local parameter registration is only supported with FSDP2.")
+            if not isinstance(model, torch.nn.Module):
+                raise TypeError("`model` must be a `torch.nn.Module`.")
+            if isinstance(parameter_names, str):
+                raise TypeError("`parameter_names` must be an iterable of fully qualified names, not a string.")
+            parameter_names = tuple(parameter_names)
+            if any(not isinstance(name, str) or not name for name in parameter_names):
+                raise TypeError("`parameter_names` must contain only non-empty strings.")
+            if len(parameter_names) != len(set(parameter_names)):
+                raise ValueError("`parameter_names` must not contain duplicates.")
+
+            named_parameters = dict(model.named_parameters())
+            missing_names = sorted(set(parameter_names).difference(named_parameters))
+            if missing_names:
+                raise ValueError(f"Rank-local parameter names were not found in the model: {missing_names}")
+        except Exception as error:
+            local_error = error
+            parameter_names = ()
+
+        Accelerator._synchronize_fsdp2_rank_local_contract(parameter_names, local_error)
+
+        registry = getattr(self, "_fsdp2_rank_local_parameters", None)
+        if registry is None:
+            registry = weakref.WeakKeyDictionary()
+            self._fsdp2_rank_local_parameters = registry
+        registry[model] = {name: weakref.ref(named_parameters[name]) for name in parameter_names}
+
+    def _get_fsdp2_rank_local_parameters(self, model: torch.nn.Module) -> tuple[str, ...]:
+        registry = getattr(self, "_fsdp2_rank_local_parameters", None)
+        registered = registry.get(model, {}) if registry is not None else {}
+        if not registered:
+            return ()
+
+        named_parameters = dict(model.named_parameters())
+        changed_names = [
+            name for name, parameter_ref in registered.items() if named_parameters.get(name) is not parameter_ref()
+        ]
+        local_error = None
+        if changed_names:
+            local_error = RuntimeError(
+                f"Registered FSDP2 rank-local parameters changed before model preparation: {sorted(changed_names)}"
             )
+        parameter_names = tuple(registered)
+        Accelerator._synchronize_fsdp2_rank_local_contract(parameter_names, local_error)
+        return parameter_names
+
+    @staticmethod
+    def _synchronize_fsdp2_rank_local_contract(parameter_names, local_error) -> None:
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            if local_error is not None:
+                raise local_error
+            return
+
+        local_error_message = None if local_error is None else f"{type(local_error).__name__}: {local_error}"
+        payloads = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(payloads, (tuple(parameter_names), local_error_message))
+        errors = [f"rank {rank}: {payload[1]}" for rank, payload in enumerate(payloads) if payload[1] is not None]
+        if errors:
+            raise RuntimeError(f"FSDP2 rank-local parameter registration failed: {'; '.join(errors)}")
+        if any(payload[0] != payloads[0][0] for payload in payloads[1:]):
+            raise RuntimeError("FSDP2 rank-local parameter names must be identical on every rank.")
 
     def prepare_model(
         self, model: torch.nn.Module, device_placement: bool | None = None, evaluation_mode: bool = False
