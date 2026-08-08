@@ -117,6 +117,8 @@ def _get_fsdp2_model_state_dict(model, adapter_only=False, excluded_parameter_na
     excluded_names = ()
     named_parameters = {}
     try:
+        if not isinstance(adapter_only, bool):
+            raise TypeError("`adapter_only` must be a boolean.")
         if isinstance(excluded_parameter_names, str):
             raise TypeError("`excluded_parameter_names` must be an iterable of parameter names, not a string.")
 

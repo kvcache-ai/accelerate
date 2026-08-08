@@ -4093,6 +4093,17 @@ class Accelerator:
         ```
         """
 
+        if self.is_fsdp2:
+            from .utils.fsdp_utils import _get_fsdp2_model_state_dict
+
+            return _get_fsdp2_model_state_dict(
+                model,
+                adapter_only=adapter_only,
+                excluded_parameter_names=excluded_parameter_names,
+            )
+
+        if not isinstance(adapter_only, bool):
+            raise TypeError("`adapter_only` must be a boolean.")
         if isinstance(excluded_parameter_names, str):
             raise TypeError("`excluded_parameter_names` must be an iterable of parameter names, not a string.")
         excluded_parameter_names = tuple(excluded_parameter_names)
@@ -4130,14 +4141,6 @@ class Accelerator:
                 from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
 
                 state_dict = clone_tensors_for_torch_save(self.unwrap_model(model).state_dict())
-        elif self.is_fsdp2:
-            from .utils.fsdp_utils import _get_fsdp2_model_state_dict
-
-            state_dict = _get_fsdp2_model_state_dict(
-                model,
-                adapter_only=adapter_only,
-                excluded_parameter_names=excluded_parameter_names,
-            )
         elif self.distributed_type == DistributedType.FSDP:
             from torch.distributed.fsdp import FullStateDictConfig, StateDictType
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP

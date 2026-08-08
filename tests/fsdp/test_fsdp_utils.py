@@ -181,6 +181,20 @@ def test_fsdp2_adapter_only_state_dict_handles_omitted_exclusion():
     assert not model.placeholder.requires_grad
 
 
+@pytest.mark.parametrize(
+    ("adapter_only", "excluded_parameter_names"),
+    [("yes", ()), (True, None), (True, "placeholder")],
+)
+def test_fsdp2_state_dict_validation_uses_synchronized_preflight(adapter_only, excluded_parameter_names):
+    with pytest.raises(RuntimeError, match="FSDP2 state-dict preflight failed"):
+        Accelerator.get_state_dict(
+            _fsdp2_accelerator_stub(),
+            AdapterStateModel(),
+            adapter_only=adapter_only,
+            excluded_parameter_names=excluded_parameter_names,
+        )
+
+
 def test_fsdp2_staged_optimizer_must_reference_prepared_model():
     model = AdapterStateModel()
     accelerator = SimpleNamespace(_models=[model])
