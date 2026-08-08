@@ -3049,9 +3049,8 @@ class KTransformersPlugin:
         enabled (`bool`, defaults to env ACCELERATE_USE_KT or False):
             Whether to enable KT wrapping.
         kt_config (`Any`, defaults to None):
-            KT-kernel configuration. Accepts a ``kt_kernel.sft.KTConfig`` object
-            or a dict (passed to ``KTConfig(**dict)``). If None, a default
-            ``KTConfig()`` is created (reads ACCELERATE_KT_* env vars).
+            Opaque KT-owned runtime configuration. Accelerate stores this value without importing KT or interpreting
+            its fields.
         bypass_device_map_check (`bool`, defaults to True):
             Skip Accelerate's device_map validation.
         skip_device_placement (`bool`, defaults to True):
@@ -3076,22 +3075,6 @@ class KTransformersPlugin:
     def __post_init__(self):
         if self.enabled is None:
             self.enabled = parse_flag_from_env("ACCELERATE_USE_KT", default=False)
-
-        # Resolve kt_config: dict → KTConfig, None → default KTConfig
-        if self.kt_config is None:
-            try:
-                from kt_kernel.sft import KTConfig
-
-                self.kt_config = KTConfig()
-            except ImportError:
-                self.kt_config = None
-        elif isinstance(self.kt_config, dict):
-            try:
-                from kt_kernel.sft import KTConfig
-
-                self.kt_config = KTConfig(**self.kt_config)
-            except ImportError:
-                pass  # keep as dict if kt_kernel not installed
 
         if self.bypass_device_map_check is None:
             self.bypass_device_map_check = parse_flag_from_env("ACCELERATE_KT_BYPASS_DEVICE_MAP", default=True)

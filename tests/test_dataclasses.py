@@ -29,11 +29,17 @@ from accelerate.utils.versions import compare_versions, is_torch_version
 
 
 def test_ktransformers_plugin_keeps_runtime_config_opaque():
-    runtime_config = object()
+    runtime_config = {"kernel_owned_field": object()}
 
     plugin = KTransformersPlugin(enabled=True, kt_config=runtime_config)
 
     assert plugin.kt_config is runtime_config
+
+
+def test_ktransformers_plugin_does_not_materialize_default_runtime_config():
+    plugin = KTransformersPlugin(enabled=True)
+
+    assert plugin.kt_config is None
 
 
 def _should_skip_cp_test(cp_size):
