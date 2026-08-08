@@ -3097,6 +3097,18 @@ class Accelerator:
         backend = str(torch.distributed.get_backend()).lower()
         return torch.device("cpu") if backend == "gloo" else torch.device(device)
 
+    @staticmethod
+    def _materialize_fsdp2_grad_norm(model_norm: torch.Tensor) -> torch.Tensor:
+        placements = getattr(model_norm, "placements", ())
+        if placements and not all(placement.is_replicate() for placement in placements):
+            full_tensor = getattr(model_norm, "full_tensor", None)
+            if full_tensor is None:
+                raise RuntimeError("FSDP2 model gradient norm cannot be materialized as a replicated tensor.")
+            return full_tensor()
+        if hasattr(model_norm, "to_local"):
+            return model_norm.to_local()
+        return model_norm
+
     def _clip_grad_norm_with_rank_local_parameters(self, parameters, rank_local_parameters, max_norm, norm_type):
         if self.distributed_type != DistributedType.FSDP or not self.is_fsdp2:
             distributed_world_size = (
@@ -3220,11 +3232,7 @@ class Accelerator:
         model_norm = get_total_norm(
             [parameter.grad for parameter in model_parameters if parameter.grad is not None], norm_type=2.0
         )
-        placements = getattr(model_norm, "placements", ())
-        if placements and not all(placement.is_replicate() for placement in placements):
-            raise RuntimeError("FSDP2 model gradient norm must be replicated before it can be combined.")
-        if hasattr(model_norm, "to_local"):
-            model_norm = model_norm.to_local()
+        model_norm = Accelerator._materialize_fsdp2_grad_norm(model_norm)
         model_norm = model_norm.detach().to(device=collective_device, dtype=torch.float32)
         combined_norm = torch.sqrt(model_norm.square() + preflight_and_norm[1])
         clip_grads_with_norm = getattr(torch.nn.utils, "clip_grads_with_norm_", None)
