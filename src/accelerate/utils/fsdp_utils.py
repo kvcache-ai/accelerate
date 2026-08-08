@@ -53,19 +53,25 @@ def disable_fsdp_ram_efficient_loading():
     os.environ["FSDP_CPU_RAM_EFFICIENT_LOADING"] = "False"
 
 
-def _get_model_state_dict(model, adapter_only=False, sd_options=None):
-    if adapter_only and is_peft_model(model):
-        if sd_options is not None:
-            from torch.distributed.checkpoint.state_dict import get_model_state_dict
+def _get_model_state_dict(model, adapter_only=False, sd_options=None, excluded_parameter_names=()):
+    if adapter_only and sd_options is not None:
+        from torch.distributed.checkpoint.state_dict import get_model_state_dict
 
-            adapter_options = copy.copy(sd_options)
-            adapter_options.ignore_frozen_params = True
+        adapter_options = copy.copy(sd_options)
+        adapter_options.ignore_frozen_params = True
+        excluded_names, named_parameters, adapter_names = _prepare_fsdp2_state_dict_selection(
+            model, adapter_only=True, excluded_parameter_names=excluded_parameter_names
+        )
+        original_requires_grad = _enable_fsdp2_excluded_parameters(named_parameters, excluded_names)
+        try:
             state_dict = get_model_state_dict(model, options=adapter_options)
-            adapter_names = _fsdp2_adapter_parameter_names(model)
-            state_dict = {name: value for name, value in state_dict.items() if name in adapter_names}
-            _validate_fsdp2_adapter_state_dict(model, state_dict, adapter_options)
-            return state_dict
+        finally:
+            _restore_fsdp2_excluded_parameters(named_parameters, original_requires_grad)
+        state_dict = {name: value for name, value in state_dict.items() if name in adapter_names}
+        _validate_fsdp2_adapter_state_dict(state_dict, adapter_names, adapter_options)
+        return state_dict
 
+    if adapter_only and is_peft_model(model):
         from peft import get_peft_model_state_dict
 
         return get_peft_model_state_dict(model, adapter_name=model.active_adapter)
@@ -79,17 +85,24 @@ def _get_model_state_dict(model, adapter_only=False, sd_options=None):
         return model.state_dict()
 
 
-def _set_model_state_dict(model, state_dict, adapter_only=False, sd_options=None):
-    if adapter_only and is_peft_model(model):
-        if sd_options is not None:
-            from torch.distributed.checkpoint.state_dict import set_model_state_dict
+def _set_model_state_dict(model, state_dict, adapter_only=False, sd_options=None, excluded_parameter_names=()):
+    if adapter_only and sd_options is not None:
+        from torch.distributed.checkpoint.state_dict import set_model_state_dict
 
-            adapter_options = copy.copy(sd_options)
-            adapter_options.ignore_frozen_params = True
-            adapter_options.strict = False
-            _validate_fsdp2_adapter_state_dict(model, state_dict, adapter_options)
+        adapter_options = copy.copy(sd_options)
+        adapter_options.ignore_frozen_params = True
+        adapter_options.strict = False
+        excluded_names, named_parameters, adapter_names = _prepare_fsdp2_state_dict_selection(
+            model, adapter_only=True, excluded_parameter_names=excluded_parameter_names
+        )
+        _validate_fsdp2_adapter_state_dict(state_dict, adapter_names, adapter_options)
+        original_requires_grad = _enable_fsdp2_excluded_parameters(named_parameters, excluded_names)
+        try:
             return set_model_state_dict(model, state_dict, options=adapter_options)
+        finally:
+            _restore_fsdp2_excluded_parameters(named_parameters, original_requires_grad)
 
+    if adapter_only and is_peft_model(model):
         from peft import set_peft_model_state_dict
 
         return set_peft_model_state_dict(model, state_dict, adapter_name=model.active_adapter)
@@ -129,12 +142,7 @@ def _synchronize_state_dict_preflight(local_error):
     return tuple(f"rank {rank}: {error}" for rank, error in enumerate(errors) if error is not None)
 
 
-def _fsdp2_adapter_parameter_names(model):
-    return {name for name, parameter in model.named_parameters(remove_duplicate=False) if parameter.requires_grad}
-
-
-def _validate_fsdp2_adapter_state_dict(model, state_dict, options):
-    expected_names = _fsdp2_adapter_parameter_names(model)
+def _validate_fsdp2_adapter_state_dict(state_dict, expected_names, options):
     rank0_broadcast = (
         options.full_state_dict
         and options.broadcast_from_rank0
@@ -157,10 +165,7 @@ def _validate_fsdp2_adapter_state_dict(model, state_dict, options):
         raise RuntimeError(f"FSDP2 adapter state-dict preflight failed: {'; '.join(errors)}")
 
 
-def _get_fsdp2_model_state_dict(model, adapter_only=False, excluded_parameter_names=()):
-    """Collect an FSDP2 full state dict without gathering frozen parameters in adapter-only mode."""
-    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
-
+def _prepare_fsdp2_state_dict_selection(model, adapter_only=False, excluded_parameter_names=()):
     local_error = None
     excluded_names = ()
     named_parameters = {}
@@ -196,27 +201,54 @@ def _get_fsdp2_model_state_dict(model, adapter_only=False, excluded_parameter_na
             )
 
     included_names = {
-        name for name, parameter in named_parameters.items() if parameter.requires_grad and name not in excluded_names
+        name
+        for name, parameter in named_parameters.items()
+        if (not adapter_only or parameter.requires_grad) and name not in excluded_names
     }
-    excluded_parameters = {id(named_parameters[name]): named_parameters[name] for name in excluded_names}
+    return excluded_names, named_parameters, included_names
+
+
+def _enable_fsdp2_excluded_parameters(named_parameters, excluded_parameter_names):
+    excluded_parameters = {
+        id(named_parameters[name]): named_parameters[name] for name in set(excluded_parameter_names)
+    }
     original_requires_grad = {identity: parameter.requires_grad for identity, parameter in excluded_parameters.items()}
+    local_error = None
+    try:
+        for parameter in excluded_parameters.values():
+            parameter.requires_grad_(True)
+    except Exception as error:
+        local_error = f"{type(error).__name__}: {error}"
 
-    mutation_error = None
-    if adapter_only:
-        try:
-            # DCP's frozen-parameter filter expects every frozen parameter to be present in ``model.state_dict()``.
-            # Some integrations intentionally omit placeholder parameters, so make explicitly excluded placeholders
-            # visible to the filter and remove them from the result below.
-            for parameter in excluded_parameters.values():
-                parameter.requires_grad_(True)
-        except Exception as error:
-            mutation_error = f"{type(error).__name__}: {error}"
-
-    errors = _synchronize_state_dict_preflight(mutation_error)
+    errors = _synchronize_state_dict_preflight(local_error)
     if errors:
         for identity, parameter in excluded_parameters.items():
             parameter.requires_grad_(original_requires_grad[identity])
         raise RuntimeError(f"FSDP2 state-dict preflight failed while preparing exclusions: {'; '.join(errors)}")
+    return original_requires_grad
+
+
+def _restore_fsdp2_excluded_parameters(named_parameters, original_requires_grad):
+    restored_parameters = set()
+    for parameter in named_parameters.values():
+        identity = id(parameter)
+        if identity in original_requires_grad and identity not in restored_parameters:
+            parameter.requires_grad_(original_requires_grad[identity])
+            restored_parameters.add(identity)
+
+
+def _get_fsdp2_model_state_dict(model, adapter_only=False, excluded_parameter_names=()):
+    """Collect an FSDP2 full state dict without gathering frozen parameters in adapter-only mode."""
+    from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+    excluded_names, named_parameters, included_names = _prepare_fsdp2_state_dict_selection(
+        model,
+        adapter_only=adapter_only,
+        excluded_parameter_names=excluded_parameter_names,
+    )
+
+    if adapter_only:
+        original_requires_grad = _enable_fsdp2_excluded_parameters(named_parameters, excluded_names)
 
     try:
         state_dict = get_model_state_dict(
@@ -229,8 +261,8 @@ def _get_fsdp2_model_state_dict(model, adapter_only=False, excluded_parameter_na
             ),
         )
     finally:
-        for identity, parameter in excluded_parameters.items():
-            parameter.requires_grad_(original_requires_grad[identity])
+        if adapter_only:
+            _restore_fsdp2_excluded_parameters(named_parameters, original_requires_grad)
 
     if adapter_only:
         return {name: value for name, value in state_dict.items() if name in included_names}
@@ -240,7 +272,15 @@ def _get_fsdp2_model_state_dict(model, adapter_only=False, excluded_parameter_na
     return state_dict
 
 
-def save_fsdp_model(fsdp_plugin, accelerator, model, output_dir, model_index=0, adapter_only=False):
+def save_fsdp_model(
+    fsdp_plugin,
+    accelerator,
+    model,
+    output_dir,
+    model_index=0,
+    adapter_only=False,
+    excluded_parameter_names=(),
+):
     # Note: We import here to reduce import time from general modules, and isolate outside dependencies
     import torch.distributed.checkpoint as dist_cp
     from torch.distributed.checkpoint.default_planner import DefaultSavePlanner
@@ -265,7 +305,12 @@ def save_fsdp_model(fsdp_plugin, accelerator, model, output_dir, model_index=0, 
     sd_options = _prepare_sd_options(fsdp_plugin)
 
     with ctx:
-        state_dict = _get_model_state_dict(model, adapter_only=adapter_only, sd_options=sd_options)
+        state_dict = _get_model_state_dict(
+            model,
+            adapter_only=adapter_only,
+            sd_options=sd_options,
+            excluded_parameter_names=excluded_parameter_names,
+        )
         if fsdp_plugin.state_dict_type == StateDictType.FULL_STATE_DICT:
             weights_name = f"{FSDP_MODEL_NAME}.bin" if model_index == 0 else f"{FSDP_MODEL_NAME}_{model_index}.bin"
             output_model_file = os.path.join(output_dir, weights_name)
@@ -298,7 +343,15 @@ def save_fsdp_model(fsdp_plugin, accelerator, model, output_dir, model_index=0, 
             logger.info(f"Model saved to {ckpt_dir}")
 
 
-def load_fsdp_model(fsdp_plugin, accelerator, model, input_dir, model_index=0, adapter_only=False):
+def load_fsdp_model(
+    fsdp_plugin,
+    accelerator,
+    model,
+    input_dir,
+    model_index=0,
+    adapter_only=False,
+    excluded_parameter_names=(),
+):
     # Note: We import here to reduce import time from general modules, and isolate outside dependencies
     import torch.distributed.checkpoint as dist_cp
     from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
@@ -357,7 +410,14 @@ def load_fsdp_model(fsdp_plugin, accelerator, model, input_dir, model_index=0, a
                 else input_dir
             )
             logger.info(f"Loading model from {ckpt_dir}")
-            state_dict = {"model": _get_model_state_dict(model, adapter_only=adapter_only, sd_options=sd_options)}
+            state_dict = {
+                "model": _get_model_state_dict(
+                    model,
+                    adapter_only=adapter_only,
+                    sd_options=sd_options,
+                    excluded_parameter_names=excluded_parameter_names,
+                )
+            }
             dist_cp.load(
                 state_dict=state_dict,
                 storage_reader=dist_cp.FileSystemReader(ckpt_dir),
@@ -366,7 +426,13 @@ def load_fsdp_model(fsdp_plugin, accelerator, model, input_dir, model_index=0, a
             state_dict = state_dict["model"]
             logger.info(f"Model loaded from {ckpt_dir}")
 
-        load_result = _set_model_state_dict(model, state_dict, adapter_only=adapter_only, sd_options=sd_options)
+        load_result = _set_model_state_dict(
+            model,
+            state_dict,
+            adapter_only=adapter_only,
+            sd_options=sd_options,
+            excluded_parameter_names=excluded_parameter_names,
+        )
     return load_result
 
 

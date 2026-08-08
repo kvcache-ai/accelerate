@@ -237,7 +237,7 @@ def _run_two_rank_gradient_clip_checks(rank, world_size, rendezvous_path):
         dist.destroy_process_group()
 
 
-def _run_two_rank_adapter_checkpoint_checks(rank, world_size, rendezvous_path, output_dir):
+def _run_two_rank_adapter_checkpoint_checks(rank, world_size, rendezvous_path, output_dir, omit_placeholder):
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
     dist.init_process_group(
         backend="gloo",
@@ -251,8 +251,11 @@ def _run_two_rank_adapter_checkpoint_checks(rank, world_size, rendezvous_path, o
 
         from accelerate.utils.fsdp_utils import load_fsdp_model, save_fsdp_model
 
-        model = AdapterStateModel()
-        fully_shard(model)
+        model = AdapterStateModel(omit_placeholder=omit_placeholder)
+        if omit_placeholder:
+            fully_shard(model, ignored_params={model.placeholder})
+        else:
+            fully_shard(model)
         with torch.no_grad():
             model.adapter.to_local().fill_(rank + 3)
         expected_adapter = model.adapter.full_tensor().detach().clone()
@@ -271,11 +274,11 @@ def _run_two_rank_adapter_checkpoint_checks(rank, world_size, rendezvous_path, o
             wait_for_everyone=dist.barrier,
         )
 
-        with (
-            patch("accelerate.utils.fsdp_utils.is_peft_model", return_value=True),
-            patch("accelerate.utils.fsdp_utils.logger.info"),
-        ):
-            save_fsdp_model(plugin, accelerator, model, output_dir, adapter_only=True)
+        with patch("accelerate.utils.fsdp_utils.logger.info"):
+            checkpoint_kwargs = {"adapter_only": True}
+            if omit_placeholder:
+                checkpoint_kwargs["excluded_parameter_names"] = ("placeholder",)
+            save_fsdp_model(plugin, accelerator, model, output_dir, **checkpoint_kwargs)
             dist.barrier()
 
             checkpoint_path = os.path.join(output_dir, "pytorch_model_fsdp.bin")
@@ -289,17 +292,25 @@ def _run_two_rank_adapter_checkpoint_checks(rank, world_size, rendezvous_path, o
                 model.adapter.to_local().fill_(-7)
                 model.frozen.to_local().fill_(rank + 20)
             expected_mutated_base = model.frozen.full_tensor().detach().clone()
+            expected_placeholder = (
+                model.placeholder.detach().clone()
+                if omit_placeholder
+                else model.placeholder.full_tensor().detach().clone()
+            )
 
-            load_fsdp_model(plugin, accelerator, model, output_dir, adapter_only=True)
+            load_fsdp_model(plugin, accelerator, model, output_dir, **checkpoint_kwargs)
             torch.testing.assert_close(model.adapter.full_tensor(), expected_adapter)
             torch.testing.assert_close(model.frozen.full_tensor(), expected_mutated_base)
+            restored_placeholder = model.placeholder if omit_placeholder else model.placeholder.full_tensor()
+            torch.testing.assert_close(restored_placeholder, expected_placeholder)
+            assert not model.placeholder.requires_grad
 
             dist.barrier()
             if rank == 0:
                 torch.save({}, checkpoint_path)
             dist.barrier()
             with pytest.raises(RuntimeError, match="rank 0: adapter state keys do not match"):
-                load_fsdp_model(plugin, accelerator, model, output_dir, adapter_only=True)
+                load_fsdp_model(plugin, accelerator, model, output_dir, **checkpoint_kwargs)
     finally:
         dist.destroy_process_group()
 
@@ -742,14 +753,15 @@ def test_fsdp2_combined_gradient_clipping_is_symmetric_across_two_ranks():
         mp.spawn(_run_two_rank_gradient_clip_checks, args=(2, rendezvous_path), nprocs=2, join=True)
 
 
+@pytest.mark.parametrize("omit_placeholder", [False, True])
 @pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="requires torch.distributed gloo")
-def test_fsdp2_adapter_checkpoint_round_trip_is_exact_across_two_ranks():
+def test_fsdp2_adapter_checkpoint_round_trip_is_exact_across_two_ranks(omit_placeholder):
     with tempfile.TemporaryDirectory() as temporary_directory:
         rendezvous_path = f"{temporary_directory}/rendezvous"
         output_dir = f"{temporary_directory}/checkpoint"
         mp.spawn(
             _run_two_rank_adapter_checkpoint_checks,
-            args=(2, rendezvous_path, output_dir),
+            args=(2, rendezvous_path, output_dir, omit_placeholder),
             nprocs=2,
             join=True,
         )
