@@ -3066,7 +3066,11 @@ class KTransformersPlugin:
     kt_config: Any = None
     bypass_device_map_check: bool | None = None
     skip_device_placement: bool | None = None
-    allowed_distributed_types: tuple[DistributedType, ...] = (DistributedType.NO, DistributedType.FSDP, DistributedType.MULTI_GPU)
+    allowed_distributed_types: tuple[DistributedType, ...] = (
+        DistributedType.NO,
+        DistributedType.FSDP,
+        DistributedType.MULTI_GPU,
+    )
     require_single_process: bool = False
 
     def __post_init__(self):
@@ -3077,33 +3081,23 @@ class KTransformersPlugin:
         if self.kt_config is None:
             try:
                 from kt_kernel.sft import KTConfig
+
                 self.kt_config = KTConfig()
             except ImportError:
                 self.kt_config = None
         elif isinstance(self.kt_config, dict):
             try:
                 from kt_kernel.sft import KTConfig
+
                 self.kt_config = KTConfig(**self.kt_config)
             except ImportError:
                 pass  # keep as dict if kt_kernel not installed
 
-        # Set skip_expert_loading default when enabled
-        if self.kt_config is not None and self.enabled:
-            if getattr(self.kt_config, "kt_skip_expert_loading", None) is None:
-                try:
-                    self.kt_config.kt_skip_expert_loading = True
-                except Exception:
-                    pass
-
         if self.bypass_device_map_check is None:
-            self.bypass_device_map_check = parse_flag_from_env(
-                "ACCELERATE_KT_BYPASS_DEVICE_MAP", default=True
-            )
+            self.bypass_device_map_check = parse_flag_from_env("ACCELERATE_KT_BYPASS_DEVICE_MAP", default=True)
 
         if self.skip_device_placement is None:
-            self.skip_device_placement = parse_flag_from_env(
-                "ACCELERATE_KT_SKIP_DEVICE_PLACEMENT", default=True
-            )
+            self.skip_device_placement = parse_flag_from_env("ACCELERATE_KT_SKIP_DEVICE_PLACEMENT", default=True)
 
 
 @dataclass

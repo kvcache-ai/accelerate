@@ -19,39 +19,22 @@ from accelerate.utils.launch import _apply_kt_config_to_env, prepare_multi_gpu_e
 
 
 class TestApplyKTConfigToEnv(unittest.TestCase):
-    def test_serializes_activation_policy_for_workers(self):
+    def test_forwards_only_enable_flag(self):
         args = argparse.Namespace(
             kt_config={
                 "enabled": True,
                 "kt_activation_policy": {"cpu": "retain", "gpu": "recompute"},
+                "kt_expert_weight_format": "int8",
+                "future_kt_field": "opaque",
             }
         )
 
         env = _apply_kt_config_to_env(args, {})
 
         self.assertEqual(env["ACCELERATE_USE_KT"], "true")
-        self.assertEqual(
-            env["ACCELERATE_KT_ACTIVATION_POLICY"],
-            '{"cpu":"retain","gpu":"recompute"}',
-        )
+        self.assertEqual(set(env), {"ACCELERATE_USE_KT"})
 
-    def test_explicit_worker_env_takes_precedence(self):
-        args = argparse.Namespace(
-            kt_config={
-                "enabled": True,
-                "kt_activation_policy": {"cpu": "retain", "gpu": "recompute"},
-            }
-        )
-        existing = '{"cpu":"recompute","gpu":"recompute"}'
-
-        env = _apply_kt_config_to_env(
-            args,
-            {"ACCELERATE_KT_ACTIVATION_POLICY": existing},
-        )
-
-        self.assertEqual(env["ACCELERATE_KT_ACTIVATION_POLICY"], existing)
-
-    def test_disabled_kt_does_not_forward_activation_policy(self):
+    def test_disabled_kt_only_forwards_enable_flag(self):
         args = argparse.Namespace(
             kt_config={
                 "enabled": False,
@@ -62,63 +45,7 @@ class TestApplyKTConfigToEnv(unittest.TestCase):
         env = _apply_kt_config_to_env(args, {})
 
         self.assertEqual(env["ACCELERATE_USE_KT"], "false")
-        self.assertNotIn("ACCELERATE_KT_ACTIVATION_POLICY", env)
-
-    def test_forwards_weight_and_training_fields(self):
-        args = argparse.Namespace(
-            kt_config={
-                "enabled": True,
-                "kt_expert_weight_format": "int8",
-                "kt_weight_lifecycle": "persistent",
-                "kt_expert_checkpoint_path": "/weights/experts",
-                "kt_non_expert_weight_path": "/weights/non-experts",
-                "kt_lora_dropout": 0.1,
-                "kt_train_mode": "lora",
-            }
-        )
-
-        env = _apply_kt_config_to_env(args, {})
-
-        self.assertEqual(env["ACCELERATE_KT_EXPERT_WEIGHT_FORMAT"], "int8")
-        self.assertEqual(env["ACCELERATE_KT_WEIGHT_LIFECYCLE"], "persistent")
-        self.assertEqual(env["ACCELERATE_KT_EXPERT_CHECKPOINT_PATH"], "/weights/experts")
-        self.assertEqual(env["ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH"], "/weights/non-experts")
-        self.assertEqual(env["ACCELERATE_KT_LORA_DROPOUT"], "0.1")
-        self.assertEqual(env["ACCELERATE_KT_TRAIN_MODE"], "lora")
-
-    def test_forwards_false_boolean(self):
-        args = argparse.Namespace(
-            kt_config={
-                "enabled": True,
-                "kt_force_fused_expert_lora": False,
-            }
-        )
-
-        env = _apply_kt_config_to_env(args, {})
-
-        self.assertEqual(env["ACCELERATE_KT_FORCE_FUSED_EXPERT_LORA"], "false")
-
-    def test_existing_worker_env_takes_precedence_for_runtime_fields(self):
-        args = argparse.Namespace(
-            kt_config={
-                "enabled": True,
-                "kt_expert_weight_format": "int8",
-                "kt_weight_lifecycle": "ephemeral",
-                "kt_non_expert_weight_path": "/config/non-experts",
-                "kt_force_fused_expert_lora": False,
-            }
-        )
-        existing = {
-            "ACCELERATE_KT_EXPERT_WEIGHT_FORMAT": "bf16",
-            "ACCELERATE_KT_WEIGHT_LIFECYCLE": "persistent",
-            "ACCELERATE_KT_NON_EXPERT_WEIGHT_PATH": "/env/non-experts",
-            "ACCELERATE_KT_FORCE_FUSED_EXPERT_LORA": "true",
-        }
-
-        env = _apply_kt_config_to_env(args, existing.copy())
-
-        for key, value in existing.items():
-            self.assertEqual(env[key], value)
+        self.assertEqual(env, {"ACCELERATE_USE_KT": "false"})
 
 
 class TestPrepareMultiGpuEnv(unittest.TestCase):

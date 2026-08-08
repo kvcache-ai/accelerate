@@ -17,7 +17,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from accelerate.parallelism_config import ParallelismConfig
-from accelerate.utils import patch_environment
+from accelerate.utils import KTransformersPlugin, patch_environment
 from accelerate.utils.constants import (
     BETA_CP_AVAILABLE_PYTORCH_VERSION,
     BETA_SP_AVAILABLE_DEEPSPEED_VERSION,
@@ -26,6 +26,14 @@ from accelerate.utils.constants import (
 )
 from accelerate.utils.imports import is_deepspeed_available, is_transformers_available
 from accelerate.utils.versions import compare_versions, is_torch_version
+
+
+def test_ktransformers_plugin_keeps_runtime_config_opaque():
+    runtime_config = object()
+
+    plugin = KTransformersPlugin(enabled=True, kt_config=runtime_config)
+
+    assert plugin.kt_config is runtime_config
 
 
 def _should_skip_cp_test(cp_size):
