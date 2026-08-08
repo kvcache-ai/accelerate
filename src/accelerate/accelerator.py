@@ -637,8 +637,7 @@ class Accelerator:
         self._dataloaders = []
         self._custom_objects = []
         self._fsdp2_rank_local_parameters = weakref.WeakKeyDictionary()
-        self._fsdp2_source_parameter_ids = frozenset()
-        self._fsdp2_current_parameter_ids = frozenset()
+        self._fsdp2_source_parameter_refs = ()
 
         # Hooks
         self._load_model_state_pre_hook = OrderedDict()
@@ -1720,7 +1719,9 @@ class Accelerator:
             else:
                 model = torch.compile(model, **self.state.dynamo_plugin.to_kwargs())
 
-        source_model_parameter_ids = {id(parameter) for parameter in model.parameters()}
+        source_model_parameters = tuple(model.parameters())
+        source_model_parameter_ids = {id(parameter) for parameter in source_model_parameters}
+        source_model_parameter_refs = tuple(weakref.ref(parameter) for parameter in source_model_parameters)
 
         # Get old params and canonicalize - we canonicalize to have the mapping easy
         old_named_params = fsdp2_canonicalize_names(self._get_named_parameters(*tuple(result), drop_refs=True))
@@ -1760,8 +1761,7 @@ class Accelerator:
 
         # Replace the old model with the new one (shouldn't be needed as everything should be in place)
         result[model_index] = model
-        self._fsdp2_source_parameter_ids = frozenset(source_model_parameter_ids)
-        self._fsdp2_current_parameter_ids = frozenset(id(parameter) for parameter in model.parameters())
+        self._fsdp2_source_parameter_refs = source_model_parameter_refs
 
         # Get new params and canonicalize
         new_named_params = fsdp2_canonicalize_names(self._get_named_parameters(*result))
@@ -1810,9 +1810,13 @@ class Accelerator:
             )
 
         prepared_parameter_ids = {id(parameter) for parameter in self._models[0].parameters()}
-        prepared_boundary_parameter_ids = set(getattr(self, "_fsdp2_current_parameter_ids", prepared_parameter_ids))
-        stale_parameter_ids = set(getattr(self, "_fsdp2_source_parameter_ids", ())).difference(
-            prepared_boundary_parameter_ids
+        live_source_parameters = tuple(
+            parameter
+            for parameter_ref in getattr(self, "_fsdp2_source_parameter_refs", ())
+            if (parameter := parameter_ref()) is not None
+        )
+        stale_parameter_ids = {id(parameter) for parameter in live_source_parameters}.difference(
+            prepared_parameter_ids
         )
         for optimizer_index, optimizer in enumerate(optimizers):
             optimizer_parameter_ids = {

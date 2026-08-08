@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import os
 import tempfile
 import weakref
@@ -277,18 +278,36 @@ def test_fsdp2_staged_optimizer_rejects_stale_model_parameter_even_when_mixed():
     optimizer = torch.optim.AdamW([source_parameter, *prepared_model.parameters()])
     accelerator = SimpleNamespace(
         _models=[prepared_model],
-        _fsdp2_source_parameter_ids=frozenset({id(source_parameter)}),
+        _fsdp2_source_parameter_refs=(weakref.ref(source_parameter),),
     )
 
     with pytest.raises(ValueError, match="before it was prepared"):
         Accelerator._validate_fsdp2_prepare_inputs(accelerator, [], [optimizer])
 
 
+def test_fsdp2_staged_optimizer_ignores_released_source_parameter_identity():
+    released_source_parameter = torch.nn.Parameter(torch.ones(1))
+    released_source_ref = weakref.ref(released_source_parameter)
+    del released_source_parameter
+    gc.collect()
+    assert released_source_ref() is None
+
+    prepared_model = torch.nn.Linear(1, 1)
+    external_parameter = torch.nn.Parameter(torch.ones(1))
+    optimizer = torch.optim.AdamW([*prepared_model.parameters(), external_parameter])
+    accelerator = SimpleNamespace(
+        _models=[prepared_model],
+        _fsdp2_source_parameter_refs=(released_source_ref,),
+    )
+
+    Accelerator._validate_fsdp2_prepare_inputs(accelerator, [], [optimizer])
+
+
 def test_fsdp2_staged_optimizer_validates_each_optimizer():
     prepared_model = torch.nn.Linear(1, 1)
     valid_optimizer = torch.optim.AdamW(prepared_model.parameters())
     unrelated_optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
-    accelerator = SimpleNamespace(_models=[prepared_model], _fsdp2_source_parameter_ids=frozenset())
+    accelerator = SimpleNamespace(_models=[prepared_model], _fsdp2_source_parameter_refs=())
 
     with pytest.raises(ValueError, match="optimizer 1 does not reference"):
         Accelerator._validate_fsdp2_prepare_inputs(
@@ -446,7 +465,7 @@ def test_fsdp2_joint_prepare_preserves_external_optimizer_parameter_identity():
             )
             self._models = []
             self.fp8_backend = FP8BackendType.NO
-            self._fsdp2_source_parameter_ids = frozenset()
+            self._fsdp2_source_parameter_refs = ()
 
         def _prepare_one(self, obj, **kwargs):
             return obj
