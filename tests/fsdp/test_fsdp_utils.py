@@ -84,6 +84,9 @@ class StagedPrepareHarness:
     def verify_device_map(self, model):
         return False
 
+    def _validate_kt_distributed_setup(self, objects):
+        pass
+
     def _validate_fsdp2_prepare_inputs(self, models, optimizers):
         return Accelerator._validate_fsdp2_prepare_inputs(self, models, optimizers)
 

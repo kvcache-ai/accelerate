@@ -636,7 +636,7 @@ class Accelerator:
         self._schedulers = []
         self._dataloaders = []
         self._custom_objects = []
-        self._fsdp2_rank_local_parameters = weakref.WeakKeyDictionary()
+        self._fsdp2_rank_local_parameters = None
         self._fsdp2_source_parameter_refs = ()
 
         # Hooks
