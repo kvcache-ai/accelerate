@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib.util as _u
+
 from ..parallelism_config import ParallelismConfig
 from .ao import convert_model_to_fp8_ao, filter_first_and_last_linear_layers, has_ao_layers
 from .constants import (
@@ -69,10 +71,6 @@ from .dataclasses import (
     TorchTensorParallelPlugin,
     add_model_config_to_megatron_parser,
 )
-
-import importlib.util as _u
-KT_KERNEL_AVAILABLE = _u.find_spec("kt_kernel") is not None
-
 from .environment import (
     are_libraries_initialized,
     check_cuda_fp8_capability,
@@ -307,3 +305,6 @@ from .transformer_engine import (
     convert_model,
     has_transformer_engine_layers,
 )
+
+
+KT_KERNEL_AVAILABLE = _u.find_spec("kt_kernel") is not None
