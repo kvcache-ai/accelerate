@@ -97,28 +97,6 @@ def setup_fp8_env(args: argparse.Namespace, current_env: dict[str, str]):
     return current_env
 
 
-def _apply_kt_config_to_env(args: argparse.Namespace, current_env: dict[str, str]) -> dict[str, str]:
-    """
-    Mirror the KT enable flag from the accelerate config file into the worker environment.
-
-    ``kt_config`` is owned by KT and deliberately remains opaque to Accelerate. Callers that need runtime settings
-    should construct and pass a ``KTransformersPlugin`` in the worker process instead of relying on field-specific
-    environment variables.
-    """
-    kt_config = getattr(args, "kt_config", None)
-    if not kt_config:
-        return current_env
-
-    enabled = kt_config.get("enabled", True)
-    if "ACCELERATE_USE_KT" not in current_env and enabled is not None:
-        current_env["ACCELERATE_USE_KT"] = str(bool(enabled)).lower()
-
-    if not enabled:
-        return current_env
-
-    return current_env
-
-
 def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
     """
     Prepares and returns the command list and an environment with the correct simple launcher environment variables.
@@ -217,7 +195,6 @@ def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> tuple[list[str]
     current_env["OMP_NUM_THREADS"] = str(args.num_cpu_threads_per_process)
     if args.enable_cpu_affinity:
         current_env["ACCELERATE_CPU_AFFINITY"] = "1"
-    current_env = _apply_kt_config_to_env(args, current_env)
     return cmd, current_env
 
 
@@ -419,7 +396,6 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> dict[str, str]:
     if args.use_parallelism_config:
         current_env = prepare_extend_env_parallelism_config(args, current_env)
 
-    current_env = _apply_kt_config_to_env(args, current_env)
     return current_env
 
 

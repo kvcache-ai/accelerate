@@ -15,37 +15,7 @@
 import argparse
 import unittest
 
-from accelerate.utils.launch import _apply_kt_config_to_env, prepare_multi_gpu_env
-
-
-class TestApplyKTConfigToEnv(unittest.TestCase):
-    def test_forwards_only_enable_flag(self):
-        args = argparse.Namespace(
-            kt_config={
-                "enabled": True,
-                "kt_activation_policy": {"cpu": "retain", "gpu": "recompute"},
-                "kt_expert_weight_format": "int8",
-                "future_kt_field": "opaque",
-            }
-        )
-
-        env = _apply_kt_config_to_env(args, {})
-
-        self.assertEqual(env["ACCELERATE_USE_KT"], "true")
-        self.assertEqual(set(env), {"ACCELERATE_USE_KT"})
-
-    def test_disabled_kt_only_forwards_enable_flag(self):
-        args = argparse.Namespace(
-            kt_config={
-                "enabled": False,
-                "kt_activation_policy": {"cpu": "retain", "gpu": "recompute"},
-            }
-        )
-
-        env = _apply_kt_config_to_env(args, {})
-
-        self.assertEqual(env["ACCELERATE_USE_KT"], "false")
-        self.assertEqual(env, {"ACCELERATE_USE_KT": "false"})
+from accelerate.utils.launch import prepare_multi_gpu_env
 
 
 class TestPrepareMultiGpuEnv(unittest.TestCase):

@@ -620,7 +620,15 @@ def test_fsdp2_prepare_unions_all_ignored_parameter_sources():
     }
 
 
-def test_fsdp2_joint_prepare_preserves_external_optimizer_parameter_identity():
+def test_fsdp2_optimizer_switch_rejects_unmapped_parameter():
+    parameter = torch.nn.Parameter(torch.ones(1))
+    optimizer = torch.optim.AdamW([parameter])
+
+    with pytest.raises(KeyError, match="requires every optimizer parameter to belong to the model"):
+        fsdp2_switch_optimizer_parameters(optimizer, {})
+
+
+def test_fsdp2_joint_prepare_rejects_external_optimizer_parameter():
     class JointPrepareHarness:
         def __init__(self):
             self.state = SimpleNamespace(
@@ -632,7 +640,6 @@ def test_fsdp2_joint_prepare_preserves_external_optimizer_parameter_identity():
             )
             self._models = []
             self.fp8_backend = FP8BackendType.NO
-            self._fsdp2_source_parameter_refs = ()
 
         def _prepare_one(self, obj, **kwargs):
             return obj
@@ -641,32 +648,18 @@ def test_fsdp2_joint_prepare_preserves_external_optimizer_parameter_identity():
             return Accelerator._get_named_parameters(self, *objects, drop_refs=drop_refs)
 
         def _get_fsdp2_rank_local_parameters(self, model):
-            return {}
+            return ()
 
     accelerator = JointPrepareHarness()
     model = torch.nn.Linear(2, 2)
     external_parameter = torch.nn.Parameter(torch.ones(2))
-    optimizer = torch.optim.AdamW([model.weight, model.bias, external_parameter])
+    optimizer = torch.optim.AdamW([*model.parameters(), external_parameter])
 
-    with patch("accelerate.accelerator.fsdp2_prepare_model", return_value=model):
-        _, prepared_optimizer = Accelerator._prepare_fsdp2(accelerator, model, optimizer)
-
-    prepared_parameters = prepared_optimizer.param_groups[0]["params"]
-    assert prepared_parameters[0] is model.weight
-    assert prepared_parameters[1] is model.bias
-    assert prepared_parameters[2] is external_parameter
-
-
-def test_fsdp2_optimizer_switch_rejects_model_owned_mapping_miss():
-    model_owned_parameter = torch.nn.Parameter(torch.ones(1))
-    optimizer = torch.optim.AdamW([model_owned_parameter])
-
-    with pytest.raises(KeyError, match="model-owned optimizer parameter"):
-        fsdp2_switch_optimizer_parameters(
-            optimizer,
-            {},
-            model_owned_parameter_ids=(id(model_owned_parameter),),
-        )
+    with (
+        patch("accelerate.accelerator.fsdp2_prepare_model", return_value=model),
+        pytest.raises(KeyError, match="Use `prepare\\(model\\)` followed by `prepare\\(optimizer\\)`"),
+    ):
+        Accelerator._prepare_fsdp2(accelerator, model, optimizer)
 
 
 def test_rank_local_gradient_clipping_in_non_distributed_training():

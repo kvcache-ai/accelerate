@@ -1710,7 +1710,7 @@ class Accelerator:
             if isinstance(obj, torch.nn.Module):
                 model_index, model = i, obj
 
-        # Invariant: if we have a model, we also have an optimizer (checked in `prepare`)
+        # Optimizer-only staged preparation does not need to wrap the model again.
         if model_index is None:
             return tuple(result)
 
@@ -1732,7 +1732,6 @@ class Accelerator:
                 model = torch.compile(model, **self.state.dynamo_plugin.to_kwargs())
 
         source_model_parameters = tuple(model.parameters())
-        source_model_parameter_ids = {id(parameter) for parameter in source_model_parameters}
         source_model_parameter_refs = tuple(weakref.ref(parameter) for parameter in source_model_parameters)
 
         # Get old params and canonicalize - we canonicalize to have the mapping easy
@@ -1741,22 +1740,16 @@ class Accelerator:
         # Swap the optimizer parameters with empty, so `fully_shard` after will not allocate too much memory
         from torch.distributed.tensor import DTensor
 
-        model_owned_placeholders = {}
         for obj in result:
             if isinstance(obj, torch.optim.Optimizer):
-                placeholders = set()
                 for param_group in obj.param_groups:
                     for i, p in enumerate(param_group["params"]):
-                        if id(p) not in source_model_parameter_ids:
-                            continue
                         # We drop a reference to the original param here, so that _move_states_to_device triggers a reallocation
                         # We reassign the data_ptr to the original param, so that we preserve the mapping to the new ones
                         param_group["params"][i] = torch.empty(1, dtype=p.dtype, device=p.device)
                         param_group["params"][i].data_ptr = (
                             p._local_tensor.data_ptr() if isinstance(p, DTensor) else p.data_ptr()
                         )
-                        placeholders.add(id(param_group["params"][i]))
-                model_owned_placeholders[id(obj)] = placeholders
 
         self._models.append(model)
 
@@ -1800,11 +1793,7 @@ class Accelerator:
         # Update the optimizer parameters
         for obj in result:
             if isinstance(obj, torch.optim.Optimizer):
-                fsdp2_switch_optimizer_parameters(
-                    obj,
-                    mapping,
-                    model_owned_parameter_ids=model_owned_placeholders.get(id(obj), ()),
-                )
+                fsdp2_switch_optimizer_parameters(obj, mapping)
 
         return result
 

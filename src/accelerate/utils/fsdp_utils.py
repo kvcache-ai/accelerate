@@ -863,9 +863,7 @@ def fsdp2_load_full_state_dict(
     return model
 
 
-def fsdp2_switch_optimizer_parameters(
-    optimizer: torch.optim.Optimizer, mapping: dict, model_owned_parameter_ids: Iterable[int] = ()
-):
+def fsdp2_switch_optimizer_parameters(optimizer: torch.optim.Optimizer, mapping: dict):
     """
     Switches the parameters of the optimizer to new ones (sharded parameters in usual case). This function modifies the
     optimizer in-place.
@@ -873,26 +871,23 @@ def fsdp2_switch_optimizer_parameters(
     Args:
         optimizer (`torch.optim.Optimizer`): Optimizer instance which contains the original model parameters
         mapping (`dict`): Mapping from the original parameter (specified by `data_ptr`) to the sharded parameter
-        model_owned_parameter_ids (`Iterable[int]`, defaults to `()`): Identities of temporary model-parameter
-            placeholders that must have an entry in ``mapping``. Other parameters are kept unchanged.
-
     Raises:
         KeyError:
-            If a parameter in the optimizer couldn't be switched to its sharded version. This should never happen and
-            indicates a bug. If we kept the original params instead of raising, the training wouldn't be numerically
-            correct and weights wouldn't get updated.
+            If a parameter in the optimizer could not be switched to its sharded version. Joint FSDP2 preparation
+            supports only model-owned optimizer parameters; external or rank-local parameters require staged
+            `prepare(model)` then `prepare(optimizer)` calls.
     """
-    model_owned_parameter_ids = set(model_owned_parameter_ids)
     for param_group in optimizer.param_groups:
         new_params = []
         for p in param_group["params"]:
             ptr = p.data_ptr if not callable(getattr(p, "data_ptr", None)) else p.data_ptr()
             if ptr in mapping:
                 new_params.append(mapping[ptr])
-            elif id(p) in model_owned_parameter_ids:
-                raise KeyError("A model-owned optimizer parameter could not be mapped after FSDP2 preparation.")
             else:
-                new_params.append(p)
+                raise KeyError(
+                    "Joint FSDP2 preparation requires every optimizer parameter to belong to the model. "
+                    "Use `prepare(model)` followed by `prepare(optimizer)` for external or rank-local parameters."
+                )
         param_group["params"] = new_params
 
 
