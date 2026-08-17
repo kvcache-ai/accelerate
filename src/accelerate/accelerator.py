@@ -23,7 +23,9 @@ import os
 import re
 import shutil
 import warnings
+import weakref
 from collections import OrderedDict
+from collections.abc import Iterable
 from contextlib import contextmanager
 from functools import partial
 from types import MethodType
@@ -634,6 +636,8 @@ class Accelerator:
         self._schedulers = []
         self._dataloaders = []
         self._custom_objects = []
+        self._fsdp2_rank_local_parameters = None
+        self._fsdp2_source_parameter_refs = ()
 
         # Hooks
         self._load_model_state_pre_hook = OrderedDict()
@@ -1425,6 +1429,16 @@ class Accelerator:
         # Return the unprocessed object if previous criteria was not met
         return obj
 
+    def _validate_kt_distributed_setup(self, objects) -> None:
+        if not any(isinstance(obj, torch.nn.Module) for obj in objects):
+            return
+
+        kt_plugin = getattr(self.state, "kt_config", None)
+        if kt_plugin is not None and kt_plugin.enabled:
+            kt_plugin.validate_distributed_setup(
+                self.distributed_type, is_fsdp2=self.is_fsdp2, num_processes=self.num_processes
+            )
+
     def prepare(self, *args, device_placement=None):
         """
         Prepare all objects passed in `args` for distributed training and mixed precision, then return them in the same
@@ -1449,6 +1463,10 @@ class Accelerator:
 
         </Tip>
 
+        With FSDP2, a model and its optimizer can either be prepared together, or prepared in two stages. Staged
+        preparation must call ``prepare(model)`` first, construct the optimizer from the prepared model parameters,
+        and then call ``prepare(optimizer)``.
+
         Examples:
 
         ```python
@@ -1471,6 +1489,8 @@ class Accelerator:
         ... )
         ```
         """
+        self._validate_kt_distributed_setup(args)
+
         if device_placement is None:
             device_placement = [None for _ in args]
         elif self.distributed_type in (DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM):
@@ -1481,9 +1501,7 @@ class Accelerator:
             )
 
         kt_plugin = getattr(self.state, "kt_config", None)
-        kt_bypass_device_map = bool(
-            kt_plugin is not None and kt_plugin.enabled and kt_plugin.bypass_device_map_check
-        )
+        kt_bypass_device_map = bool(kt_plugin is not None and kt_plugin.enabled and kt_plugin.bypass_device_map_check)
 
         for obj in args:
             # TODO: Look at enabling native TP training directly with a proper config
@@ -1524,22 +1542,9 @@ class Accelerator:
                 )
 
         if self.is_fsdp2:
-            model_count = 0
-            optimizer_count = 0
-            for i, obj in enumerate(args):
-                if isinstance(obj, torch.nn.Module):
-                    model_count += 1
-                elif isinstance(obj, torch.optim.Optimizer):
-                    optimizer_count += 1
-
-            # This needs to be written as such, so that passing other objects other than models/optimizers doesn't raise an error
-            if (model_count < 1 and optimizer_count > 0) or (model_count > 0 and optimizer_count < 1):
-                raise ValueError(
-                    "When using FSDP2, a model and optimizer must be passed together to `Accelerator.prepare()`"
-                    " as the optimizer needs to have its parameters modified after the model is converted."
-                )
-            if model_count > 1:
-                raise ValueError("Only one model is supported when using FSDP2")
+            models = [obj for obj in args if isinstance(obj, torch.nn.Module)]
+            optimizers = [obj for obj in args if isinstance(obj, torch.optim.Optimizer)]
+            self._validate_fsdp2_prepare_inputs(models, optimizers)
 
         # If we're dealing with device placement, this deals with that by...
         tpu_should_fix_optimizer = self.device_placement and self.distributed_type == DistributedType.XLA
@@ -1705,33 +1710,11 @@ class Accelerator:
             if isinstance(obj, torch.nn.Module):
                 model_index, model = i, obj
 
-        # Invariant: if we have a model, we also have an optimizer (checked in `prepare`)
+        # Optimizer-only staged preparation does not need to wrap the model again.
         if model_index is None:
             return tuple(result)
 
-        # Register KT expert modules as ignored_modules for FSDP2.
-        # Only ignore the experts submodule (CPU-side, managed by KT kernel).
-        # The router (gate) and shared_experts remain FSDP2-managed.
-        kt_plugin = getattr(self.state, "kt_config", None)
-        if kt_plugin is not None and kt_plugin.enabled:
-            kt_wrappers = getattr(model, "_kt_wrappers", None)
-            if kt_wrappers is None:
-                _base = model
-                for _attr in ("base_model", "model"):
-                    _base = getattr(_base, _attr, None)
-                    if _base is None:
-                        break
-                    kt_wrappers = getattr(_base, "_kt_wrappers", None)
-                    if kt_wrappers is not None:
-                        break
-            if kt_wrappers is not None:
-                if self.state.fsdp_plugin.ignored_modules is None:
-                    self.state.fsdp_plugin.ignored_modules = []
-                for wrapper in kt_wrappers:
-                    experts_attr = getattr(wrapper, "_experts_attr", "experts")
-                    experts = getattr(wrapper, experts_attr, None)
-                    if experts is not None and experts not in self.state.fsdp_plugin.ignored_modules:
-                        self.state.fsdp_plugin.ignored_modules.append(experts)
+        rank_local_parameter_names = self._get_fsdp2_rank_local_parameters(model)
 
         # Needs to be done first, to make sure AC + fully_shard will work as expected
         self.state.fsdp_plugin.set_auto_wrap_policy(model)
@@ -1747,6 +1730,9 @@ class Accelerator:
                 model = compile_regions(model, **self.state.dynamo_plugin.to_kwargs())
             else:
                 model = torch.compile(model, **self.state.dynamo_plugin.to_kwargs())
+
+        source_model_parameters = tuple(model.parameters())
+        source_model_parameter_refs = tuple(weakref.ref(parameter) for parameter in source_model_parameters)
 
         # Get old params and canonicalize - we canonicalize to have the mapping easy
         old_named_params = fsdp2_canonicalize_names(self._get_named_parameters(*tuple(result), drop_refs=True))
@@ -1768,7 +1754,11 @@ class Accelerator:
         self._models.append(model)
 
         # Prepare everything FSDP2 related for the model (except AC)
-        model = fsdp2_prepare_model(self, model)
+        model = fsdp2_prepare_model(
+            self,
+            model,
+            rank_local_parameter_names=rank_local_parameter_names,
+        )
 
         # Remove the old model from the list
         if len(self._models) > 1 and (self._models[-2] is self._models[-1]):
@@ -1776,6 +1766,7 @@ class Accelerator:
 
         # Replace the old model with the new one (shouldn't be needed as everything should be in place)
         result[model_index] = model
+        self._fsdp2_source_parameter_refs = source_model_parameter_refs
 
         # Get new params and canonicalize
         new_named_params = fsdp2_canonicalize_names(self._get_named_parameters(*result))
@@ -1805,6 +1796,116 @@ class Accelerator:
                 fsdp2_switch_optimizer_parameters(obj, mapping)
 
         return result
+
+    def _validate_fsdp2_prepare_inputs(self, models, optimizers):
+        if len(models) > 1:
+            raise ValueError("Only one model is supported when using FSDP2")
+        if len(models) == 1 and not optimizers and self._models:
+            raise ValueError("Only one prepared model is supported when using staged FSDP2 preparation.")
+        if models or not optimizers:
+            return
+        if len(self._models) != 1:
+            raise ValueError(
+                "Staged FSDP2 optimizer preparation requires exactly one model prepared by an earlier "
+                "`Accelerator.prepare(model)` call."
+            )
+
+        prepared_parameter_ids = {id(parameter) for parameter in self._models[0].parameters()}
+        live_source_parameters = tuple(
+            parameter
+            for parameter_ref in getattr(self, "_fsdp2_source_parameter_refs", ())
+            if (parameter := parameter_ref()) is not None
+        )
+        stale_parameter_ids = {id(parameter) for parameter in live_source_parameters}.difference(
+            prepared_parameter_ids
+        )
+        for optimizer_index, optimizer in enumerate(optimizers):
+            optimizer_parameter_ids = {
+                id(parameter) for parameter_group in optimizer.param_groups for parameter in parameter_group["params"]
+            }
+            if optimizer_parameter_ids.intersection(stale_parameter_ids):
+                raise ValueError(
+                    f"Staged FSDP2 optimizer {optimizer_index} references parameters from the model before it was "
+                    "prepared. Construct the optimizer after `Accelerator.prepare(model)`."
+                )
+            if optimizer_parameter_ids.isdisjoint(prepared_parameter_ids):
+                raise ValueError(
+                    f"Staged FSDP2 optimizer {optimizer_index} does not reference any parameter from the prepared "
+                    "model. Construct the optimizer after `Accelerator.prepare(model)`; additional rank-local "
+                    "parameters are allowed."
+                )
+
+    def register_fsdp2_rank_local_parameters(self, model: torch.nn.Module, parameter_names: Iterable[str]) -> None:
+        """Register model parameters that an external integration owns outside FSDP2.
+
+        The names must be fully qualified names from ``model.named_parameters()``. Registered parameters are ignored
+        by FSDP2 and are not materialized or broadcast by FSDP2's full-state loader.
+        """
+        local_error = None
+        named_parameters = {}
+        try:
+            if not self.is_fsdp2:
+                raise ValueError("Rank-local parameter registration is only supported with FSDP2.")
+            if not isinstance(model, torch.nn.Module):
+                raise TypeError("`model` must be a `torch.nn.Module`.")
+            if isinstance(parameter_names, str):
+                raise TypeError("`parameter_names` must be an iterable of fully qualified names, not a string.")
+            parameter_names = tuple(parameter_names)
+            if any(not isinstance(name, str) or not name for name in parameter_names):
+                raise TypeError("`parameter_names` must contain only non-empty strings.")
+            if len(parameter_names) != len(set(parameter_names)):
+                raise ValueError("`parameter_names` must not contain duplicates.")
+
+            named_parameters = dict(model.named_parameters())
+            missing_names = sorted(set(parameter_names).difference(named_parameters))
+            if missing_names:
+                raise ValueError(f"Rank-local parameter names were not found in the model: {missing_names}")
+        except Exception as error:
+            local_error = error
+            parameter_names = ()
+
+        Accelerator._synchronize_fsdp2_rank_local_contract(parameter_names, local_error)
+
+        registry = getattr(self, "_fsdp2_rank_local_parameters", None)
+        if registry is None:
+            registry = weakref.WeakKeyDictionary()
+            self._fsdp2_rank_local_parameters = registry
+        registry[model] = {name: weakref.ref(named_parameters[name]) for name in parameter_names}
+
+    def _get_fsdp2_rank_local_parameters(self, model: torch.nn.Module) -> tuple[str, ...]:
+        registry = getattr(self, "_fsdp2_rank_local_parameters", None)
+        registered = registry.get(model, {}) if registry is not None else {}
+        if not registered:
+            return ()
+
+        named_parameters = dict(model.named_parameters())
+        changed_names = [
+            name for name, parameter_ref in registered.items() if named_parameters.get(name) is not parameter_ref()
+        ]
+        local_error = None
+        if changed_names:
+            local_error = RuntimeError(
+                f"Registered FSDP2 rank-local parameters changed before model preparation: {sorted(changed_names)}"
+            )
+        parameter_names = tuple(registered)
+        Accelerator._synchronize_fsdp2_rank_local_contract(parameter_names, local_error)
+        return parameter_names
+
+    @staticmethod
+    def _synchronize_fsdp2_rank_local_contract(parameter_names, local_error) -> None:
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            if local_error is not None:
+                raise local_error
+            return
+
+        local_error_message = None if local_error is None else f"{type(local_error).__name__}: {local_error}"
+        payloads = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(payloads, (tuple(parameter_names), local_error_message))
+        errors = [f"rank {rank}: {payload[1]}" for rank, payload in enumerate(payloads) if payload[1] is not None]
+        if errors:
+            raise RuntimeError(f"FSDP2 rank-local parameter registration failed: {'; '.join(errors)}")
+        if any(payload[0] != payloads[0][0] for payload in payloads[1:]):
+            raise RuntimeError("FSDP2 rank-local parameter names must be identical on every rank.")
 
     def prepare_model(
         self, model: torch.nn.Module, device_placement: bool | None = None, evaluation_mode: bool = False
@@ -1836,24 +1937,15 @@ class Accelerator:
         if device_placement is None:
             device_placement = self.device_placement and self.distributed_type != DistributedType.FSDP
 
-        self._models.append(model)
-
         kt_plugin = getattr(self.state, "kt_config", None)
-        kt_bypass_device_map = bool(
-            kt_plugin is not None and kt_plugin.enabled and kt_plugin.bypass_device_map_check
-        )
+        kt_bypass_device_map = bool(kt_plugin is not None and kt_plugin.enabled and kt_plugin.bypass_device_map_check)
+
+        self._validate_kt_distributed_setup((model,))
+
+        self._models.append(model)
 
         if kt_plugin is not None and kt_plugin.enabled and kt_plugin.skip_device_placement:
             device_placement = False
-
-        if kt_plugin is not None and kt_plugin.enabled:
-            if kt_plugin.require_single_process and self.num_processes != 1:
-                raise ValueError("KT plugin requires single-process execution (num_processes=1).")
-            if self.distributed_type not in kt_plugin.allowed_distributed_types:
-                raise ValueError(
-                    f"KT plugin does not allow distributed_type={self.distributed_type}. "
-                    f"Allowed: {kt_plugin.allowed_distributed_types}"
-                )
 
         # TODO: Look at enabling native TP training directly with a proper config
         if (
@@ -2994,9 +3086,173 @@ class Accelerator:
                     opt = opt.optimizer
                 self.scaler.unscale_(opt)
 
-    def clip_grad_norm_(self, parameters, max_norm, norm_type=2):
+    @staticmethod
+    def _fsdp2_grad_clip_collective_device(device: torch.device) -> torch.device:
+        backend = str(torch.distributed.get_backend()).lower()
+        return torch.device("cpu") if backend == "gloo" else torch.device(device)
+
+    @staticmethod
+    def _materialize_fsdp2_grad_norm(model_norm: torch.Tensor) -> torch.Tensor:
+        placements = getattr(model_norm, "placements", ())
+        if placements and not all(placement.is_replicate() for placement in placements):
+            full_tensor = getattr(model_norm, "full_tensor", None)
+            if full_tensor is None:
+                raise RuntimeError("FSDP2 model gradient norm cannot be materialized as a replicated tensor.")
+            return full_tensor()
+        if hasattr(model_norm, "to_local"):
+            return model_norm.to_local()
+        return model_norm
+
+    def _clip_grad_norm_with_rank_local_parameters(self, parameters, rank_local_parameters, max_norm, norm_type):
+        if self.distributed_type != DistributedType.FSDP or not self.is_fsdp2:
+            distributed_world_size = (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 1
+            )
+            if self.distributed_type != DistributedType.NO or distributed_world_size != 1:
+                raise RuntimeError(
+                    "`rank_local_parameters` gradient clipping is supported only in non-distributed training or "
+                    "with FSDP2."
+                )
+
+            model_parameters = [parameters] if isinstance(parameters, torch.Tensor) else list(parameters)
+            rank_local_parameters = (
+                [rank_local_parameters]
+                if isinstance(rank_local_parameters, torch.Tensor)
+                else list(rank_local_parameters)
+            )
+            if any(not isinstance(parameter, torch.Tensor) for parameter in rank_local_parameters):
+                raise TypeError("`rank_local_parameters` must contain only tensors.")
+            rank_local_parameter_ids = [id(parameter) for parameter in rank_local_parameters]
+            if len(rank_local_parameter_ids) != len(set(rank_local_parameter_ids)):
+                raise ValueError("`rank_local_parameters` must not contain duplicates.")
+            if set(rank_local_parameter_ids).intersection(id(parameter) for parameter in model_parameters):
+                raise ValueError("`rank_local_parameters` must be identity-disjoint from `parameters`.")
+            if float(norm_type) != 2.0:
+                raise ValueError("`rank_local_parameters` gradient clipping supports only `norm_type=2`.")
+
+            self.unscale_gradients()
+            return torch.nn.utils.clip_grad_norm_([*model_parameters, *rank_local_parameters], max_norm, norm_type=2.0)
+
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            raise RuntimeError("FSDP2 combined gradient clipping requires an initialized process group.")
+
+        collective_device = Accelerator._fsdp2_grad_clip_collective_device(self.device)
+        rank_local_parameters_input = rank_local_parameters
+        model_parameters = ()
+        rank_local_parameters = ()
+        local_error = None
+        try:
+            if float(norm_type) != 2.0:
+                raise ValueError("FSDP2 combined gradient clipping supports only `norm_type=2`.")
+            max_norm = float(max_norm)
+            if math.isnan(max_norm) or max_norm < 0:
+                raise ValueError("`max_norm` must be a non-negative number.")
+
+            model_parameters = (parameters,) if isinstance(parameters, torch.Tensor) else tuple(parameters)
+            rank_local_parameters = (
+                (rank_local_parameters_input,)
+                if isinstance(rank_local_parameters_input, torch.Tensor)
+                else tuple(rank_local_parameters_input)
+            )
+            if any(not isinstance(parameter, torch.Tensor) for parameter in model_parameters):
+                raise TypeError("`parameters` must contain only tensors.")
+            if any(not isinstance(parameter, torch.Tensor) for parameter in rank_local_parameters):
+                raise TypeError("`rank_local_parameters` must contain only tensors.")
+
+            model_parameter_ids = [id(parameter) for parameter in model_parameters]
+            rank_local_parameter_ids = [id(parameter) for parameter in rank_local_parameters]
+            if len(rank_local_parameter_ids) != len(set(rank_local_parameter_ids)):
+                raise ValueError("`rank_local_parameters` must not contain duplicates.")
+            if set(model_parameter_ids).intersection(rank_local_parameter_ids):
+                raise ValueError("`rank_local_parameters` must be identity-disjoint from `parameters`.")
+
+            matching_models = []
+            for model in self._models:
+                candidate_parameters = tuple(model.parameters())
+                if len(candidate_parameters) == len(model_parameter_ids) and all(
+                    id(parameter) == parameter_id
+                    for parameter, parameter_id in zip(candidate_parameters, model_parameter_ids)
+                ):
+                    matching_models.append(model)
+            if len(matching_models) != 1:
+                raise ValueError("`parameters` must be the complete parameter iterable of one prepared FSDP2 model.")
+
+            from torch.distributed.tensor import DTensor
+
+            if any(isinstance(parameter, DTensor) for parameter in rank_local_parameters):
+                raise TypeError("`rank_local_parameters` must be ordinary rank-local tensors, not DTensors.")
+        except Exception as error:
+            local_error = error
+
+        try:
+            self.unscale_gradients()
+        except Exception as error:
+            if local_error is None:
+                local_error = error
+
+        preflight_and_norm = torch.zeros(2, dtype=torch.float32, device=collective_device)
+        if local_error is None:
+            try:
+                from torch.distributed.tensor import DTensor
+
+                for parameter in rank_local_parameters:
+                    gradient = parameter.grad
+                    if gradient is None:
+                        continue
+                    if isinstance(gradient, DTensor):
+                        raise TypeError("Rank-local gradients must be ordinary tensors, not DTensors.")
+                    gradient_values = gradient.coalesce().values() if gradient.is_sparse else gradient
+                    preflight_and_norm[1].add_(gradient_values.detach().float().square().sum().to(collective_device))
+            except Exception as error:
+                local_error = error
+        if local_error is not None:
+            preflight_and_norm[0] = 1
+
+        torch.distributed.all_reduce(preflight_and_norm, op=torch.distributed.ReduceOp.SUM)
+        if preflight_and_norm[0].item() != 0:
+            local_error_message = None if local_error is None else f"{type(local_error).__name__}: {local_error}"
+            error_messages = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(error_messages, local_error_message)
+            errors = [f"rank {rank}: {message}" for rank, message in enumerate(error_messages) if message is not None]
+            raise RuntimeError(f"FSDP2 combined gradient-clipping preflight failed: {'; '.join(errors)}")
+
+        get_total_norm = getattr(torch.nn.utils, "get_total_norm", None)
+        if get_total_norm is None:
+            # PyTorch 2.6 has the helper used by `clip_grad_norm_`, but does not export its public alias.
+            from torch.nn.utils.clip_grad import _get_total_norm as get_total_norm
+
+        model_norm = get_total_norm(
+            [parameter.grad for parameter in model_parameters if parameter.grad is not None], norm_type=2.0
+        )
+        model_norm = Accelerator._materialize_fsdp2_grad_norm(model_norm)
+        model_norm = model_norm.detach().to(device=collective_device, dtype=torch.float32)
+        combined_norm = torch.sqrt(model_norm.square() + preflight_and_norm[1])
+        clip_grads_with_norm = getattr(torch.nn.utils, "clip_grads_with_norm_", None)
+        if clip_grads_with_norm is None:
+            from torch.nn.utils.clip_grad import _clip_grads_with_norm_ as clip_grads_with_norm
+
+        clip_grads_with_norm(model_parameters, max_norm, combined_norm)
+        clip_grads_with_norm(rank_local_parameters, max_norm, combined_norm)
+        return combined_norm
+
+    def clip_grad_norm_(self, parameters, max_norm, norm_type=2, *, rank_local_parameters=None):
         """
         Should be used in place of `torch.nn.utils.clip_grad_norm_`.
+
+        Args:
+            parameters (`Iterable[torch.Tensor]`):
+                Parameters whose gradients should be clipped.
+            max_norm (`float`):
+                Maximum norm of the gradients.
+            norm_type (`float`, *optional*, defaults to 2):
+                Type of the used p-norm.
+            rank_local_parameters (`Iterable[torch.Tensor]`, *optional*):
+                Additional optimizer parameters that are not part of the prepared model and may exist on only some
+                ranks. With FSDP2, pass this argument explicitly on every rank (an empty iterable on non-owner ranks)
+                to include their gradients in one global L2 norm and clipping coefficient. The tensors must be
+                identity-disjoint from `parameters`. Only `norm_type=2` is supported with this argument.
 
         Returns:
             `torch.Tensor`: Total norm of the parameter gradients (viewed as a single vector).
@@ -3019,6 +3275,10 @@ class Accelerator:
         ...     optimizer.step()
         ```
         """
+        if rank_local_parameters is not None:
+            return Accelerator._clip_grad_norm_with_rank_local_parameters(
+                self, parameters, rank_local_parameters, max_norm, norm_type
+            )
         if self.distributed_type == DistributedType.FSDP:
             self.unscale_gradients()
             parameters = [p for p in parameters]
@@ -4045,7 +4305,7 @@ class Accelerator:
                         break
         return (model_device, optimizer_device)
 
-    def get_state_dict(self, model, unwrap=True):
+    def get_state_dict(self, model, unwrap=True, adapter_only=False, excluded_parameter_names=()):
         """
         Returns the state dictionary of a model sent through [`Accelerator.prepare`] potentially without full
         precision.
@@ -4055,6 +4315,14 @@ class Accelerator:
                 A PyTorch model sent through [`Accelerator.prepare`]
             unwrap (`bool`, *optional*, defaults to `True`):
                 Whether to return the original underlying state_dict of `model` or to return the wrapped state_dict
+            adapter_only (`bool`, *optional*, defaults to `False`):
+                Return only trainable parameter tensors. For FSDP2 this avoids gathering frozen model parameters and
+                returns the full adapter state dict on rank 0 only. Selective state dicts are not supported for
+                DeepSpeed or FSDP1.
+            excluded_parameter_names (`Iterable[str]`, *optional*, defaults to `()`):
+                Fully qualified parameter names to omit. With FSDP2 adapter-only saves, this also allows integrations
+                to identify frozen placeholders that are intentionally absent from ``model.state_dict()``. Every rank
+                must pass the same names.
 
         Returns:
             `dict`: The state dictionary of the model potentially without full precision.
@@ -4071,6 +4339,28 @@ class Accelerator:
         >>> state_dict = accelerator.get_state_dict(net)
         ```
         """
+
+        if self.is_fsdp2:
+            from .utils.fsdp_utils import _get_fsdp2_model_state_dict
+
+            return _get_fsdp2_model_state_dict(
+                model,
+                adapter_only=adapter_only,
+                excluded_parameter_names=excluded_parameter_names,
+            )
+
+        if not isinstance(adapter_only, bool):
+            raise TypeError("`adapter_only` must be a boolean.")
+        if isinstance(excluded_parameter_names, str):
+            raise TypeError("`excluded_parameter_names` must be an iterable of parameter names, not a string.")
+        excluded_parameter_names = tuple(excluded_parameter_names)
+        selective_state_dict = adapter_only or bool(excluded_parameter_names)
+
+        if selective_state_dict and self.distributed_type in (DistributedType.DEEPSPEED, DistributedType.FSDP):
+            if not self.is_fsdp2:
+                raise NotImplementedError(
+                    "Selective state dicts are currently supported for FSDP2, but not DeepSpeed or FSDP1."
+                )
 
         if self.distributed_type == DistributedType.DEEPSPEED:
             zero3_sharding = self.deepspeed_config["zero_optimization"]["stage"] == 3
@@ -4098,11 +4388,6 @@ class Accelerator:
                 from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
 
                 state_dict = clone_tensors_for_torch_save(self.unwrap_model(model).state_dict())
-        elif self.is_fsdp2:
-            from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
-
-            options = StateDictOptions(full_state_dict=True, broadcast_from_rank0=True, cpu_offload=True)
-            state_dict = get_model_state_dict(model, options=options)
         elif self.distributed_type == DistributedType.FSDP:
             from torch.distributed.fsdp import FullStateDictConfig, StateDictType
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -4114,6 +4399,18 @@ class Accelerator:
             if unwrap:
                 model = self.unwrap_model(model)
             state_dict = model.state_dict()
+
+            if selective_state_dict:
+                named_parameters = dict(model.named_parameters(remove_duplicate=False))
+                missing_names = sorted(set(excluded_parameter_names).difference(named_parameters))
+                if missing_names:
+                    raise ValueError(f"Excluded parameter names were not found in the model: {missing_names}")
+                included_names = {
+                    name
+                    for name, parameter in named_parameters.items()
+                    if (not adapter_only or parameter.requires_grad) and name not in excluded_parameter_names
+                }
+                state_dict = {name: value for name, value in state_dict.items() if name in included_names}
 
         return state_dict
 
