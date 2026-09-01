@@ -17,8 +17,9 @@ import os
 import pickle
 import tempfile
 import time
+from types import SimpleNamespace
 from unittest import skip
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import psutil
 import torch
@@ -49,7 +50,12 @@ from accelerate.test_utils.testing import (
     require_non_torch_xla,
     require_torchdata_stateful_dataloader,
 )
-from accelerate.utils import FP8RecipeKwargs, is_torchdata_stateful_dataloader_available, patch_environment
+from accelerate.utils import (
+    FP8RecipeKwargs,
+    KTransformersPlugin,
+    is_torchdata_stateful_dataloader_available,
+    patch_environment,
+)
 from accelerate.utils.dataclasses import DataLoaderConfiguration
 from accelerate.utils.modeling import get_state_dict_from_offload, load_checkpoint_in_model
 from accelerate.utils.random import set_seed
@@ -132,6 +138,82 @@ def parameterized_custom_name_func(func, param_num, param):
 
 
 class AcceleratorTester(AccelerateTestCase):
+    @staticmethod
+    def _bare_kt_accelerator(distributed_type, *, is_fsdp2=False, num_processes=2, plugin=None):
+        accelerator = Accelerator.__new__(Accelerator)
+        accelerator.state = SimpleNamespace(
+            distributed_type=distributed_type,
+            is_fsdp2=is_fsdp2,
+            kt_config=plugin or KTransformersPlugin(enabled=True),
+            num_processes=num_processes,
+            parallelism_config=None,
+            deepspeed_plugin=None,
+        )
+        accelerator.device_placement = False
+        accelerator.has_fp8_handler = False
+        accelerator._dataloaders = []
+        accelerator._models = []
+        accelerator._optimizers = []
+        accelerator._schedulers = []
+        return accelerator
+
+    @parameterized.expand(
+        [
+            (DistributedType.MULTI_GPU, False, "only single-process execution or FSDP2"),
+            (DistributedType.FSDP, False, "supports FSDP2, but not FSDP1"),
+        ]
+    )
+    def test_kt_prepare_model_rejects_unsupported_distributed_setup(self, distributed_type, is_fsdp2, error_message):
+        accelerator = self._bare_kt_accelerator(distributed_type, is_fsdp2=is_fsdp2)
+
+        with self.assertRaisesRegex(ValueError, error_message):
+            accelerator.prepare_model(torch.nn.Linear(2, 2))
+
+        self.assertEqual(accelerator._models, [])
+
+    @parameterized.expand([DistributedType.DEEPSPEED, DistributedType.MEGATRON_LM])
+    def test_kt_prepare_rejects_special_distributed_paths_before_mutation(self, distributed_type):
+        accelerator = self._bare_kt_accelerator(distributed_type)
+        model = torch.nn.Linear(2, 2)
+
+        with self.assertRaisesRegex(ValueError, "only single-process execution or FSDP2"):
+            accelerator.prepare(model)
+
+        self.assertEqual(accelerator._models, [])
+
+    def test_kt_prepare_honors_fsdp2_allow_list_narrowing_before_mutation(self):
+        plugin = KTransformersPlugin(enabled=True, allowed_distributed_types=(DistributedType.NO,))
+        accelerator = self._bare_kt_accelerator(DistributedType.FSDP, is_fsdp2=True, plugin=plugin)
+        model = torch.nn.Linear(2, 2)
+
+        with self.assertRaisesRegex(ValueError, "does not allow distributed_type=DistributedType.FSDP"):
+            accelerator.prepare(model)
+
+        self.assertEqual(accelerator._models, [])
+
+    def test_kt_prepare_accepts_fsdp2(self):
+        plugin = KTransformersPlugin(enabled=True)
+        plugin.validate_distributed_setup = Mock(wraps=plugin.validate_distributed_setup)
+        accelerator = self._bare_kt_accelerator(DistributedType.FSDP, is_fsdp2=True, plugin=plugin)
+        model = torch.nn.Linear(2, 2)
+        accelerator._validate_fsdp2_prepare_inputs = Mock()
+        accelerator._prepare_fsdp2 = Mock(return_value=(model,))
+
+        prepared = accelerator.prepare(model)
+
+        self.assertIs(prepared, model)
+        plugin.validate_distributed_setup.assert_called_once_with(DistributedType.FSDP, is_fsdp2=True, num_processes=2)
+        accelerator._prepare_fsdp2.assert_called_once_with(model)
+
+    def test_kt_prepare_without_model_skips_distributed_validation(self):
+        plugin = KTransformersPlugin(enabled=True)
+        plugin.validate_distributed_setup = Mock(side_effect=AssertionError("unexpected validation"))
+        accelerator = self._bare_kt_accelerator(DistributedType.DEEPSPEED, plugin=plugin)
+
+        accelerator._validate_kt_distributed_setup((object(),))
+
+        plugin.validate_distributed_setup.assert_not_called()
+
     def test_partial_state_after_reset(self):
         # Verifies that custom getattr errors will be thrown
         # if the state is reset, but only if trying to

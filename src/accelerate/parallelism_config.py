@@ -267,7 +267,7 @@ class ParallelismConfig:
         mesh_order = ["dp_replicate", "dp_shard", "cp", "sp", "tp"]
         sorted_items = sorted(
             mesh_dims.items(),
-            key=lambda x: (mesh_order.index(x[0])),
+            key=lambda x: mesh_order.index(x[0]),
         )
         return tuple(zip(*sorted_items))
 

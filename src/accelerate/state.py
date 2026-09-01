@@ -897,6 +897,7 @@ class AcceleratorState:
         "fsdp_plugin",
         "megatron_lm_plugin",
         "dynamo_plugin",
+        "kt_config",
     ]
 
     def __init__(
@@ -908,6 +909,7 @@ class AcceleratorState:
         fsdp_plugin=None,
         torch_tp_plugin=None,
         megatron_lm_plugin=None,
+        kt_config=None,
         parallelism_config=None,
         _from_accelerator: bool = False,
         **kwargs,
@@ -924,6 +926,7 @@ class AcceleratorState:
             self.torch_tp_plugin = torch_tp_plugin
             self.parallelism_config = parallelism_config
             self.device_mesh = None
+            self.kt_config = kt_config
             mixed_precision = (
                 parse_choice_from_env("ACCELERATE_MIXED_PRECISION", "no")
                 if mixed_precision is None

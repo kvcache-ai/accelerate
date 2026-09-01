@@ -55,8 +55,8 @@ extras["sagemaker"] = [
 ]
 
 setup(
-    name="accelerate",
-    version="1.14.0.dev0",
+    name="accelerate-kt",
+    version="1.14.0.post2",
     description="Accelerate",
     long_description=open("README.md", encoding="utf-8").read(),
     long_description_content_type="text/markdown",
@@ -64,7 +64,7 @@ setup(
     license="Apache",
     author="The Hugging Face team",
     author_email="transformers@huggingface.co",
-    url="https://github.com/huggingface/accelerate",
+    url="https://github.com/kvcache-ai/accelerate",
     package_dir={"": "src"},
     packages=find_packages("src"),
     entry_points={
@@ -82,7 +82,7 @@ setup(
         "packaging>=20.0",
         "psutil",
         "pyyaml",
-        "torch>=2.0.0",
+        "torch==2.9.1",
         "huggingface_hub>=0.21.0",
         "safetensors>=0.4.3",
     ],

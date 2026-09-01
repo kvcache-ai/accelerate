@@ -580,8 +580,8 @@ class ToFSDP2Tester(unittest.TestCase):
 
     @patch("pathlib.Path.exists")
     def test_overwrite_when_output_file_exists(self, mock_exists):
-        mock_exists.side_effect = (
-            lambda: str(mock_exists._mock_self) == "output.yaml" or mock_exists._mock_self.exists()
+        mock_exists.side_effect = lambda: (
+            str(mock_exists._mock_self) == "output.yaml" or mock_exists._mock_self.exists()
         )
 
         with self.assertRaises(

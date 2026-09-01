@@ -3037,6 +3037,88 @@ def parse_glm4_moe_config(megatron_lm_plugin, model, batch_data):
 
 
 @dataclass
+class KTransformersPlugin:
+    """
+    Plugin to enable KTransformers MoE wrapping inside Accelerate.
+
+    Follows the DeepSpeed pattern: only accelerate-framework interaction fields
+    are defined here. KT-kernel-specific configuration is passed through the
+    opaque ``kt_config`` field (similar to ``DeepSpeedPlugin.hf_ds_config``).
+
+    Args:
+        enabled (`bool`, defaults to env ACCELERATE_USE_KT or False):
+            Whether to enable KT wrapping.
+        kt_config (`Any`, defaults to None):
+            Opaque KT-owned runtime configuration. Accelerate stores this value without importing KT or interpreting
+            its fields.
+        bypass_device_map_check (`bool`, defaults to True):
+            Skip Accelerate's device_map validation.
+        skip_device_placement (`bool`, defaults to True):
+            Force device_placement=False for models wrapped by KT.
+        allowed_distributed_types (`tuple[DistributedType, ...]`):
+            Additional restriction on distributed types when KT is enabled. KT supports single-process execution and
+            FSDP2; this field can narrow, but cannot broaden, that contract.
+        require_single_process (`bool`, defaults to False):
+            Require single-process execution.
+    """
+
+    enabled: bool | None = None
+    kt_config: Any = None
+    bypass_device_map_check: bool | None = None
+    skip_device_placement: bool | None = None
+    allowed_distributed_types: tuple[DistributedType, ...] = (
+        DistributedType.NO,
+        DistributedType.FSDP,
+    )
+    require_single_process: bool = False
+
+    def __post_init__(self):
+        if self.enabled is None:
+            self.enabled = parse_flag_from_env("ACCELERATE_USE_KT", default=False)
+
+        if self.bypass_device_map_check is None:
+            self.bypass_device_map_check = parse_flag_from_env("ACCELERATE_KT_BYPASS_DEVICE_MAP", default=True)
+
+        if self.skip_device_placement is None:
+            self.skip_device_placement = parse_flag_from_env("ACCELERATE_KT_SKIP_DEVICE_PLACEMENT", default=True)
+
+        unsupported_types = set(self.allowed_distributed_types) - {DistributedType.NO, DistributedType.FSDP}
+        if unsupported_types:
+            raise ValueError(
+                "KT supports only single-process execution or FSDP2; "
+                f"allowed_distributed_types cannot include {sorted(str(item) for item in unsupported_types)}."
+            )
+
+    def validate_distributed_setup(
+        self, distributed_type: DistributedType, *, is_fsdp2: bool, num_processes: int
+    ) -> None:
+        """Validate the distributed execution contract before model preparation."""
+        if self.require_single_process and num_processes != 1:
+            raise ValueError("KT plugin requires single-process execution (num_processes=1).")
+
+        if distributed_type == DistributedType.NO:
+            if num_processes != 1:
+                raise ValueError(
+                    "KT plugin requires distributed training to use FSDP2; "
+                    f"received distributed_type={distributed_type} with num_processes={num_processes}."
+                )
+        elif distributed_type == DistributedType.FSDP:
+            if not is_fsdp2:
+                raise ValueError("KT plugin supports FSDP2, but not FSDP1.")
+        else:
+            raise ValueError(
+                "KT plugin supports only single-process execution or FSDP2; "
+                f"received distributed_type={distributed_type}."
+            )
+
+        if distributed_type not in self.allowed_distributed_types:
+            raise ValueError(
+                f"KT plugin does not allow distributed_type={distributed_type}. "
+                f"Allowed: {self.allowed_distributed_types}"
+            )
+
+
+@dataclass
 class BnbQuantizationConfig:
     """
     A plugin to enable BitsAndBytes 4bit and 8bit quantization
