@@ -3197,6 +3197,15 @@ class Accelerator:
             try:
                 from torch.distributed.tensor import DTensor
 
+                bf16_sumsq = None
+                if rank_local_parameters:
+                    try:
+                        from kt_kernel.grad_norm import bf16_sumsq
+                    except (ImportError, OSError):
+                        pass
+
+                cpu_bf16_sumsq = 0.0
+
                 for parameter in rank_local_parameters:
                     gradient = parameter.grad
                     if gradient is None:
@@ -3204,7 +3213,19 @@ class Accelerator:
                     if isinstance(gradient, DTensor):
                         raise TypeError("Rank-local gradients must be ordinary tensors, not DTensors.")
                     gradient_values = gradient.coalesce().values() if gradient.is_sparse else gradient
-                    preflight_and_norm[1].add_(gradient_values.detach().float().square().sum().to(collective_device))
+                    if (
+                        bf16_sumsq is not None
+                        and gradient_values.device.type == "cpu"
+                        and gradient_values.dtype == torch.bfloat16
+                        and gradient_values.layout == torch.strided
+                        and gradient_values.is_contiguous()
+                    ):
+                        with torch.profiler.record_function("rank_local_bf16_sumsq"):
+                            cpu_bf16_sumsq += bf16_sumsq(gradient_values.detach())
+                    else:
+                        preflight_and_norm[1].add_(gradient_values.detach().float().square().sum().to(collective_device))
+                if cpu_bf16_sumsq:
+                    preflight_and_norm[1].add_(cpu_bf16_sumsq)
             except Exception as error:
                 local_error = error
         if local_error is not None:
